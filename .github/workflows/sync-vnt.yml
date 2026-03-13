@@ -40,7 +40,8 @@ jobs:
 
       - name: 复制文件覆盖当前仓库
         run: |
-          rsync -av --delete vnt_repo/ ./
+          cp -rf vnt_repo/* ./
+          cp -rf vnt_repo/.* ./ 2>/dev/null || true
 
       - name: 删除临时目录
         run: |
