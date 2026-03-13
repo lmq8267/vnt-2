@@ -37,15 +37,31 @@ jobs:
       - name: 删除git目录避免模块
         run: |
           rm -rf vnt_repo/.git
+          rm -rf vnt_repo/.github/workflows
 
       - name: 复制文件覆盖当前仓库
         run: |
           cp -rf vnt_repo/* ./
-          cp -rf vnt_repo/.* ./ 2>/dev/null || true
 
       - name: 删除临时目录
         run: |
           rm -rf vnt_repo
+
+      - name: 检查并追加 deepwiki 徽章
+        run: |
+          # 如果 README.md 不存在就创建
+          if [ ! -f README.md ]; then
+            touch README.md
+          fi
+
+          # 检查是否包含 deepwiki
+          if grep -q "deepwiki" README.md; then
+            echo "README.md 已包含 deepwiki 自动更新徽章"
+          else
+            echo "" >> README.md
+            echo "[![问问 AI](https://deepwiki.com/badge.svg)](https://deepwiki.com/lmq8267/vnt-2)" >> README.md
+            echo "已追加 deepwiki 自动更新徽章"
+          fi
 
       - name: 配置Git
         run: |
