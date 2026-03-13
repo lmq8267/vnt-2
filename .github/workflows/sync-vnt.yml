@@ -1,0 +1,58 @@
+name: 同步VNT仓库
+
+on:
+  schedule:
+    # UTC时间 22点-05点 = 北京时间 06点-13点
+    - cron: '0 22-23 * * *'
+    - cron: '0 0-5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v5
+
+      - name: 删除历史记录
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 1
+          keep_minimum_runs: 1
+
+      - name: 设置时区
+        run: |
+          sudo timedatectl set-timezone "Asia/Shanghai"
+
+      - name: 克隆VNT仓库
+        run: |
+          git clone -b v2 https://github.com/vnt-dev/vnt vnt_repo
+
+      - name: 删除git目录避免模块
+        run: |
+          rm -rf vnt_repo/.git
+
+      - name: 复制文件覆盖当前仓库
+        run: |
+          rsync -av --delete vnt_repo/ ./
+
+      - name: 删除临时目录
+        run: |
+          rm -rf vnt_repo
+
+      - name: 配置Git
+        run: |
+          git config --global user.email "vnt-dev"
+          git config --global user.name "vnt-dev"
+
+      - name: 提交更改
+        run: |
+          git add .
+          git commit -am "同步时间： $(date '+%Y-%m-%d %H:%M:%S')" || echo "没有变化"
+          git push
