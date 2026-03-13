@@ -65,7 +65,7 @@ jobs:
 
       - name: 配置Git
         run: |
-          git config --global user.email "vnt-dev"
+          git config --global user.email "vnt-dev@email.com"
           git config --global user.name "vnt-dev"
 
       - name: 提交更改
