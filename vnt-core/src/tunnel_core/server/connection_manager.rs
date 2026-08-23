@@ -47,13 +47,14 @@ pub(crate) fn create_server_tunnel(
     app_state: AppState,
     config: &Config,
     packet_crypto: PacketCrypto,
+    default_interface: Option<rust_p2p_core::socket::LocalInterface>,
 ) -> (Vec<ServerTurnManager>, ServerOutbound, ServerRPC) {
     let mut rpc_notifier: HashMap<u32, RpcNotifier> = HashMap::new();
     let mut sender_map: HashMap<u32, Sender<(Bytes, Instant)>> = HashMap::new();
     let mut server_manager_list = Vec::with_capacity(config.server_addr.len());
     let mut server_addr_list = Vec::with_capacity(config.server_addr.len());
     for (index, server_addr) in config.server_addr.iter().enumerate() {
-        let connect_reg_config = config.to_connect_config(index);
+        let connect_reg_config = config.to_connect_config(index, default_interface.clone());
 
         let server_id = index as u32;
 
@@ -163,7 +164,6 @@ impl ServerTurnManager {
         initial_response: NetworkAddr,
     ) {
         let data_handler = ServerTurnInboundHandler::new(self.server_id, initial_response, config);
-        let task_group_ = task_group.clone();
         let Some(mut receiver) = self.receiver.take() else {
             unreachable!()
         };
@@ -188,7 +188,12 @@ impl ServerTurnManager {
                                 || reg.prefix_len != initial_response.prefix_len
                                 || reg.gateway != initial_response.gateway
                             {
-                                log::error!("虚拟网络发生变化");
+                                // 该服务器分配的虚拟网络与当前不一致，无法重连，
+                                // 只结束本服务器的任务，不影响其他服务器
+                                log::error!(
+                                    "服务器{}虚拟网络发生变化，放弃重连",
+                                    self.config.server_addr
+                                );
                                 break;
                             }
                             // 保存服务器版本
@@ -197,12 +202,16 @@ impl ServerTurnManager {
                             }
                         }
                         ResponseMessage::Error(e) => {
-                            log::error!("注册失败 {e:?}");
-                            break;
+                            // 单台服务器注册失败只影响本服务器的重连，
+                            // 退避后重试，不能拖垮整个任务组
+                            log::error!("注册失败 {e:?}，5秒后重试");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
                         }
                         _ => {
-                            log::error!("错误的注册消息");
-                            break;
+                            log::error!("错误的注册消息，5秒后重试");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
                         }
                     }
                 }
@@ -217,7 +226,6 @@ impl ServerTurnManager {
             }
             self.disconnect();
             data_handler.handle_disconnected();
-            task_group_.stop();
         });
     }
 
@@ -264,7 +272,7 @@ impl ServerTurnManager {
 /// 3. Send confirmation to all servers
 /// 4. Return the registration response
 pub async fn coordinated_registration(
-    managers: &mut Vec<ServerTurnManager>,
+    managers: &mut [ServerTurnManager],
 ) -> anyhow::Result<ResponseMessage> {
     if managers.is_empty() {
         bail!("No servers to register");

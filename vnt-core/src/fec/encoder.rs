@@ -16,6 +16,8 @@ mod fec_proto {
 }
 use crate::utils::task_control::TaskGroup;
 pub use fec_proto::FecPacket;
+#[cfg(test)]
+pub use fec_proto::ParityData;
 
 const BATCH_SIZE: usize = 10;
 const REDUNDANCY_RATE: f32 = 0.2;

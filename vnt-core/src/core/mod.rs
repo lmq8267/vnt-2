@@ -1,6 +1,6 @@
 use crate::api::VntApi;
 use crate::compression::PacketCompression;
-use crate::context::config::Config;
+use crate::context::config::{Config, DeviceMode};
 use crate::context::{AppState, NetworkAddr, NetworkRoute};
 use crate::crypto::PacketCrypto;
 use crate::enhanced_tunnel::enhanced_ipv4_tunnel;
@@ -21,8 +21,9 @@ use crate::tunnel_core::server::connection_manager::{
 };
 use crate::tunnel_core::server::rpc::ServerRPC;
 use crate::utils::task_control::TaskGroup;
-use anyhow::bail;
+use anyhow::{Context, bail};
 use ipnet::Ipv4Net;
+#[cfg(not(target_os = "android"))]
 use std::net::Ipv4Addr;
 
 pub const DEFAULT_MTU: u16 = 1380;
@@ -60,11 +61,32 @@ impl NetworkManager {
     ) -> anyhow::Result<NetworkManager> {
         let app_state = AppState::default();
         config.check()?;
+        let outbound_interface_name = config
+            .outbound_interface
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let resolved_interface =
+            crate::utils::socket::resolve_interface(outbound_interface_name.as_deref())?;
+        let default_interface = resolved_interface
+            .as_ref()
+            .map(|interface| interface.socket_interface.clone());
+        let canonical_interface_name = resolved_interface
+            .as_ref()
+            .map(|interface| interface.name.clone());
+        if let Some(name) = canonical_interface_name.as_deref() {
+            log::info!("绑定出口网卡: {name}");
+        }
         let mtu = config.mtu.unwrap_or(DEFAULT_MTU);
         let packet_crypto = PacketCrypto::new_from_str(config.password.as_deref());
         let packet_compression = PacketCompression::new(config.compress);
-        let (server_manager_list, tunnel_to_server, server_rpc) =
-            create_server_tunnel(app_state.clone(), &config, packet_crypto.clone());
+        let (server_manager_list, tunnel_to_server, server_rpc) = create_server_tunnel(
+            app_state.clone(),
+            &config,
+            packet_crypto.clone(),
+            default_interface.clone(),
+        );
         let device_io_manager = DeviceIOManager::new(task_group.clone());
         let allow_subnet = AllowSubnetExternalRoute::new(config.output.clone());
 
@@ -75,6 +97,8 @@ impl NetworkManager {
                 tunnel_to_server.clone(),
                 packet_crypto.clone(),
                 config.tunnel_port,
+                default_interface.clone(),
+                canonical_interface_name,
             )
             .await?;
 
@@ -113,11 +137,12 @@ impl NetworkManager {
             fec_encoder,
         );
         let port_mapping_manager = PortMappingManager::new(
-            config.no_tun,
+            config.device_mode == DeviceMode::No,
             config.allow_port_mapping,
             app_state.network.clone(),
+            default_interface.clone(),
         );
-        let internal_nat_inbound = if config.no_nat && !config.no_tun {
+        let internal_nat_inbound = if config.no_nat && config.device_mode != DeviceMode::No {
             None
         } else {
             let nat_inbound = InternalNatInbound::create(
@@ -126,25 +151,32 @@ impl NetworkManager {
                 hybrid_outbound.clone(),
                 allow_subnet.clone(),
                 app_state.network.clone(),
-                config.no_tun,
+                config.device_mode == DeviceMode::No,
+                default_interface.clone(),
             )
             .await?;
             Some(nat_inbound)
         };
 
-        let (enhanced_tun_inbound, tun_receiver) = if config.no_tun {
-            (
+        let (enhanced_tun_inbound, tun_receiver) = match config.device_mode {
+            DeviceMode::No => (
                 EnhancedTunInbound::Nat(
                     internal_nat_inbound
                         .clone()
-                        .expect("internal_nat_inbound must be Some when no_tun is true"),
+                        .expect("internal_nat_inbound must be Some in no-device mode"),
                 ),
                 None,
-            )
-        } else {
-            let (tun_inbound, tun_receiver) = tun_channel();
-            let tun_data_sender = TunDataInbound::new(tun_inbound, allow_subnet.clone());
-            (EnhancedTunInbound::Tun(tun_data_sender), Some(tun_receiver))
+            ),
+            mode @ (DeviceMode::Tun | DeviceMode::Tap) => {
+                let (tun_inbound, tun_receiver) = tun_channel();
+                let tun_data_sender = TunDataInbound::new(tun_inbound, allow_subnet.clone(), mode);
+                let inbound = if mode == DeviceMode::Tap {
+                    EnhancedTunInbound::Tap(tun_data_sender)
+                } else {
+                    EnhancedTunInbound::Tun(tun_data_sender)
+                };
+                (inbound, Some(tun_receiver))
+            }
         };
 
         let (enhanced_inbound, enhanced_outbound) = enhanced_ipv4_tunnel(
@@ -156,6 +188,7 @@ impl NetworkManager {
                 password: config.password.clone(),
                 open_quic_client: config.rtx,
                 port_mapping: config.port_mapping.clone(),
+                device_mode: config.device_mode,
             },
             crate::enhanced_tunnel::TunnelComponents {
                 hybrid_outbound: hybrid_outbound.clone(),
@@ -206,13 +239,27 @@ impl NetworkManager {
     }
 
     /// Register with server(s) and start data handling tasks.
-    /// This method can only be called once.
     /// Returns the registration response on success.
+    /// On connection-level failure the internal state is kept, so the call can be retried.
     pub async fn register(&mut self) -> anyhow::Result<RegisterResponse> {
         let Some(mut ctx) = self.registration_context.take() else {
             bail!("register can only be called once");
         };
+        match Self::register_impl(&self.app_state, &self.task_group, &mut ctx).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                // 注册失败时归还上下文，允许调用方重试
+                self.registration_context = Some(ctx);
+                Err(e)
+            }
+        }
+    }
 
+    async fn register_impl(
+        app_state: &AppState,
+        task_group: &TaskGroup,
+        ctx: &mut RegistrationContext,
+    ) -> anyhow::Result<RegisterResponse> {
         let is_multi_server = ctx.server_managers.len() > 1;
 
         let response = if is_multi_server {
@@ -251,69 +298,82 @@ impl NetworkManager {
             ip: reg_response.ip,
             prefix_len: reg_response.prefix_len,
         };
-        self.app_state.network.set(network_addr);
+        app_state.network.set(network_addr);
 
         // 保存服务器版本信息
         if !reg_response.server_version.is_empty() {
             for (index, _) in ctx.server_managers.iter().enumerate() {
-                self.app_state
+                app_state
                     .server_info_collection
                     .set_server_version(index as u32, reg_response.server_version.clone());
             }
         }
 
         // Start data handling tasks for all servers
-        for turn_manager in ctx.server_managers {
+        for turn_manager in ctx.server_managers.drain(..) {
             let handler_config = Box::new(InboundHandlerConfig {
                 network_route: NetworkRoute::new(
-                    self.app_state.network.clone(),
+                    app_state.network.clone(),
                     ctx.subnet_external_route.clone(),
                 ),
-                server_info: self.app_state.server_info_collection.clone(),
-                nat_info: self.app_state.nat_info.clone(),
-                peer_map: self.app_state.peer_map.clone(),
-                punch_backoff: self.app_state.punch_backoff.clone(),
+                server_info: app_state.server_info_collection.clone(),
+                nat_info: app_state.nat_info.clone(),
+                peer_map: app_state.peer_map.clone(),
+                punch_backoff: app_state.punch_backoff.clone(),
                 puncher: ctx.puncher.clone(),
                 packet_crypto: ctx.packet_crypto.clone(),
                 packet_compression: ctx.packet_compression.clone(),
                 enhanced_inbound: ctx.enhanced_inbound.clone(),
                 fec_decoder: ctx.fec_decoder.clone(),
             });
-            turn_manager.data_handle_task_connected(&self.task_group, handler_config, network_addr);
+            turn_manager.data_handle_task_connected(task_group, handler_config, network_addr);
         }
 
         Ok(RegisterResponse::Success(network_addr))
     }
 
-    pub fn is_no_tun(&self) -> bool {
-        self.config.no_tun
+    pub fn device_mode(&self) -> DeviceMode {
+        self.config.device_mode
     }
 
-    pub async fn start_tun(&mut self) -> anyhow::Result<()> {
-        let Some(receiver) = self.tun_receiver.take() else {
-            bail!("start_tun can only be called once");
-        };
-        let Some(enhanced_outbound) = self.enhanced_outbound.take() else {
-            bail!("start_tun can only be called once");
-        };
+    pub async fn start_device(&mut self) -> anyhow::Result<()> {
+        if self.tun_receiver.is_none() || self.enhanced_outbound.is_none() {
+            bail!("start_device requires tun/tap mode and can only be called once");
+        }
         let mut config = DeviceConfig::default();
-        config = config.set_mtu(self.config.mtu.unwrap_or(DEFAULT_MTU));
+        config = config
+            .set_device_mode(self.config.device_mode)
+            .set_mtu(self.config.mtu.unwrap_or(DEFAULT_MTU));
+        if self.config.device_mode == DeviceMode::Tap {
+            let net = self
+                .app_state
+                .get_network()
+                .context("network is not registered")?;
+            config = config.set_mac_addr(crate::ethernet::mac_from_ip(net.ip));
+        }
         if let Some(tun_name) = self.config.tun_name.clone() {
             config = config.set_tun_name(tun_name);
         }
+        // 失败时 tun_receiver/enhanced_outbound 不会被消耗，可以重试
         self.device_io_manager
-            .start_task(config, receiver, enhanced_outbound)
+            .start_task(config, &mut self.tun_receiver, &mut self.enhanced_outbound)
             .await
     }
     #[cfg(unix)]
-    pub async fn start_tun_fd(&mut self, tun_fd: Option<i32>) -> anyhow::Result<()> {
-        let Some(receiver) = self.tun_receiver.take() else {
-            bail!("start_tun_fd can only be called once");
-        };
-        let Some(enhanced_outbound) = self.enhanced_outbound.take() else {
-            bail!("start_tun_fd can only be called once");
-        };
-        let mut config = DeviceConfig::default();
+    pub async fn start_device_fd(&mut self, tun_fd: Option<i32>) -> anyhow::Result<()> {
+        if self.tun_receiver.is_none() || self.enhanced_outbound.is_none() {
+            bail!("start_device_fd requires tun/tap mode and can only be called once");
+        }
+        let mut config = DeviceConfig::default()
+            .set_device_mode(self.config.device_mode)
+            .set_mtu(self.config.mtu.unwrap_or(DEFAULT_MTU));
+        if self.config.device_mode == DeviceMode::Tap {
+            let net = self
+                .app_state
+                .get_network()
+                .context("network is not registered")?;
+            config = config.set_mac_addr(crate::ethernet::mac_from_ip(net.ip));
+        }
         if let Some(tun_fd) = tun_fd {
             config = config.set_tun_fd(tun_fd);
         }
@@ -321,11 +381,11 @@ impl NetworkManager {
             config = config.set_tun_name(tun_name);
         }
         self.device_io_manager
-            .start_task(config, receiver, enhanced_outbound)
+            .start_task(config, &mut self.tun_receiver, &mut self.enhanced_outbound)
             .await
     }
     #[cfg(not(target_os = "android"))]
-    pub async fn set_tun_network_ip(&self, ip: Ipv4Addr, prefix_len: u8) -> anyhow::Result<()> {
+    pub async fn set_device_network_ip(&self, ip: Ipv4Addr, prefix_len: u8) -> anyhow::Result<()> {
         self.device_io_manager.set_network(ip, prefix_len).await?;
         Ok(())
     }
@@ -335,8 +395,8 @@ impl NetworkManager {
         self.app_state.stop_network();
     }
     #[cfg(not(target_os = "android"))]
-    pub async fn tun_if_index(&self) -> anyhow::Result<u32> {
-        self.device_io_manager.tun_if_index().await
+    pub async fn device_if_index(&self) -> anyhow::Result<u32> {
+        self.device_io_manager.device_if_index().await
     }
     pub async fn wait_all_stopped(&mut self) {
         self.task_group.wait_all_stopped().await;

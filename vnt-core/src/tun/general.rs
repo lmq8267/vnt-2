@@ -1,3 +1,4 @@
+use crate::context::config::DeviceMode;
 use crate::enhanced_tunnel::outbound::EnhancedOutbound;
 use crate::protocol::ip_packet_protocol::HEAD_LENGTH;
 use crate::protocol::transmission::TransmissionBytes;
@@ -9,8 +10,10 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tun_rs::AsyncDevice;
 use tun_rs::async_framed::{Decoder, DeviceFramedRead, DeviceFramedWrite, Encoder};
-use tun_rs::{AsyncDevice, DeviceBuilder};
+#[cfg(not(target_os = "android"))]
+use tun_rs::{DeviceBuilder, Layer};
 
 #[derive(Clone)]
 pub struct DeviceIOManager {
@@ -19,16 +22,18 @@ pub struct DeviceIOManager {
 }
 type DeviceMutex = Arc<tokio::sync::Mutex<(Option<DeviceTask>, Option<(Ipv4Addr, u8)>)>>;
 pub struct DeviceTask {
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     device: Arc<AsyncDevice>,
-    task_recv: SubTask,
-    task_send: SubTask,
+    task: SubTask,
 }
 #[derive(Debug, Default)]
 pub struct DeviceConfig {
+    pub device_mode: DeviceMode,
     pub tun_name: Option<String>,
     #[cfg(unix)]
     pub tun_fd: Option<i32>,
     pub mtu: Option<u16>,
+    pub mac_addr: Option<[u8; 6]>,
 }
 
 impl DeviceConfig {
@@ -45,6 +50,14 @@ impl DeviceConfig {
         self.mtu = Some(mtu);
         self
     }
+    pub fn set_device_mode(mut self, device_mode: DeviceMode) -> Self {
+        self.device_mode = device_mode;
+        self
+    }
+    pub fn set_mac_addr(mut self, mac_addr: [u8; 6]) -> Self {
+        self.mac_addr = Some(mac_addr);
+        self
+    }
 }
 #[derive(Clone)]
 pub struct TunInbound {
@@ -52,7 +65,7 @@ pub struct TunInbound {
 }
 
 pub struct TunReceiver {
-    receiver: Receiver<TransmissionBytes>,
+    pub(crate) receiver: Receiver<TransmissionBytes>,
 }
 pub fn tun_channel() -> (TunInbound, TunReceiver) {
     let (sender, receiver) = tokio::sync::mpsc::channel(1024);
@@ -69,28 +82,37 @@ impl DeviceIOManager {
     pub async fn stop_task(&self) {
         let mut guard = self.device.lock().await;
         if let Some(dev) = guard.0.take() {
-            dev.task_recv.stop().await;
-            dev.task_send.stop().await;
+            dev.task.stop().await;
         }
     }
     pub async fn start_task(
         &self,
         device_config: DeviceConfig,
-        receiver: TunReceiver,
-        enhanced_outbound: EnhancedOutbound,
+        receiver: &mut Option<TunReceiver>,
+        enhanced_outbound: &mut Option<EnhancedOutbound>,
     ) -> anyhow::Result<()> {
+        if receiver.is_none() || enhanced_outbound.is_none() {
+            bail!("device task already started");
+        }
         self.stop_task().await;
+        // 先执行可能失败的 TUN/TAP 设备创建，成功后才消费 receiver/outbound，
+        // 保证失败时调用方状态完整、可以重试
+        let device_mode = device_config.device_mode;
+        let device = Arc::new(create_device(device_config)?);
+        let receiver = receiver.take().unwrap();
+        let enhanced_outbound = enhanced_outbound.take().unwrap();
         let task = create(
             &self.task_group,
-            device_config,
+            device,
             receiver.receiver,
             enhanced_outbound,
-        )?;
+            device_mode,
+        );
         self.device.lock().await.0.replace(task);
         Ok(())
     }
     #[cfg(not(target_os = "android"))]
-    pub async fn tun_if_index(&self) -> anyhow::Result<u32> {
+    pub async fn device_if_index(&self) -> anyhow::Result<u32> {
         let guard = self.device.lock().await;
         if let Some(v) = &guard.0 {
             Ok(v.device.if_index()?)
@@ -98,10 +120,11 @@ impl DeviceIOManager {
             bail!("device doesn't exist")
         }
     }
+    #[cfg(not(target_os = "android"))]
     pub async fn set_network(&self, ip: Ipv4Addr, prefix_len: u8) -> anyhow::Result<()> {
         let mut guard = self.device.lock().await;
         let Some(dev) = guard.0.as_ref() else {
-            bail!("未启动tun")
+            bail!("虚拟网卡尚未启动")
         };
         if let Some(v) = guard.1.as_ref()
             && v.0 == ip
@@ -117,65 +140,107 @@ impl DeviceIOManager {
     }
 }
 
-fn create_tun(config: DeviceConfig) -> anyhow::Result<AsyncDevice> {
-    #[cfg(unix)]
-    if let Some(fd) = config.tun_fd {
-        // SAFETY: Caller must ensure fd is a valid, open file descriptor for a TUN device.
-        // Using an invalid fd may cause undefined behavior.
-        unsafe { return Ok(AsyncDevice::from_fd(fd)?) }
-    }
-    let mut builder = DeviceBuilder::new();
-    if let Some(tun_name) = config.tun_name {
-        builder = builder.name(tun_name);
-    }
-    if let Some(mtu) = config.mtu {
-        builder = builder.mtu(mtu);
-    }
-    #[cfg(windows)]
+fn create_device(config: DeviceConfig) -> anyhow::Result<AsyncDevice> {
+    #[cfg(target_os = "android")]
     {
-        builder = builder.metric(1);
+        let fd = config
+            .tun_fd
+            .context("Android requires a VpnService TUN fd")?;
+        // SAFETY: The fd comes directly from ParcelFileDescriptor returned by
+        // VpnService.Builder.establish and remains open for the network lifetime.
+        return unsafe { Ok(AsyncDevice::from_fd(fd)?) };
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "android"))]
     {
-        builder = builder.offload(true);
+        #[cfg(unix)]
+        if let Some(fd) = config.tun_fd {
+            // SAFETY: Caller must ensure fd is a valid, open file descriptor for a TUN device.
+            // Using an invalid fd may cause undefined behavior.
+            unsafe { return Ok(AsyncDevice::from_fd(fd)?) }
+        }
+        let mut builder = DeviceBuilder::new();
+        builder = builder.layer(match config.device_mode {
+            DeviceMode::Tap => Layer::L2,
+            DeviceMode::Tun => Layer::L3,
+            DeviceMode::No => bail!("cannot create a device in no mode"),
+        });
+        if let Some(tun_name) = config.tun_name {
+            builder = builder.name(tun_name);
+        }
+        if let Some(mtu) = config.mtu {
+            builder = builder.mtu(mtu);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "macos",
+            target_os = "netbsd"
+        ))]
+        if let Some(mac_addr) = config.mac_addr {
+            builder = builder.mac_addr(mac_addr);
+        }
+        #[cfg(windows)]
+        {
+            builder = builder.metric(1);
+        }
+        #[cfg(target_os = "linux")]
+        if config.device_mode == DeviceMode::Tun {
+            builder = builder.offload(true);
+        }
+        let dev = builder.build_async().with_context(|| {
+            if config.device_mode == DeviceMode::Tap && cfg!(windows) {
+                "创建 TAP 失败；Windows TAP 模式需要预先安装 tap-windows (tap0901) 驱动"
+            } else if config.device_mode == DeviceMode::Tap {
+                "创建 TAP 失败"
+            } else {
+                "创建 TUN 失败"
+            }
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            _ = dev.set_tx_queue_len(1000);
+        }
+        Ok(dev)
     }
-    let dev = builder.build_async().context("创建tun失败")?;
-    #[cfg(target_os = "linux")]
-    {
-        _ = dev.set_tx_queue_len(1000);
-    }
-    Ok(dev)
 }
 fn create(
     task_group: &TaskGroup,
-    config: DeviceConfig,
+    device: Arc<AsyncDevice>,
     receiver: Receiver<TransmissionBytes>,
     enhanced_outbound: EnhancedOutbound,
-) -> anyhow::Result<DeviceTask> {
-    let device = Arc::new(create_tun(config)?);
-
+    device_mode: DeviceMode,
+) -> DeviceTask {
     let device_framed_read = DeviceFramedRead::new(device.clone(), BytesCodec::new());
     let device_framed_write = DeviceFramedWrite::new(device.clone(), BytesCodec::new());
+    let outbound_device = device.clone();
 
-    let task_recv = task_group.spawn(async move {
-        if let Err(e) = in_tun_loop(receiver, device_framed_write).await {
-            log::error!("in_tun_loop error: {e:?}")
+    // 读写两个方向合并为一个任务：任一方向结束（出错或设备关闭）即
+    // 通过 select! 取消另一方向，避免单侧失败后另一侧继续运行的半开状态
+    let task = task_group.spawn(async move {
+        tokio::select! {
+            rs = in_device_loop(receiver, device_framed_write) => {
+                if let Err(e) = rs {
+                    log::error!("in_device_loop error, stopping out_device_loop: {e:?}");
+                } else {
+                    log::warn!("in_device_loop exited, stopping out_device_loop");
+                }
+            }
+            rs = out_device_loop(device_framed_read, outbound_device, enhanced_outbound, device_mode) => {
+                if let Err(e) = rs {
+                    log::error!("out_device_loop error, stopping in_device_loop: {e:?}");
+                } else {
+                    log::warn!("out_device_loop exited, stopping in_device_loop");
+                }
+            }
         }
     });
-    let task_send = task_group.spawn(async move {
-        if let Err(e) = out_tun_loop(device_framed_read, enhanced_outbound).await {
-            log::error!("out_tun_loop error: {e:?}");
-        }
-    });
 
-    Ok(DeviceTask {
-        device,
-        task_recv,
-        task_send,
-    })
+    DeviceTask { device, task }
 }
 
-async fn in_tun_loop(
+async fn in_device_loop(
     mut receiver: Receiver<TransmissionBytes>,
     mut device_framed_write: DeviceFramedWrite<BytesCodec, Arc<AsyncDevice>>,
 ) -> anyhow::Result<()> {
@@ -183,7 +248,7 @@ async fn in_tun_loop(
         match device_framed_write.send(data).await {
             Ok(_) => {}
             Err(e) => {
-                log::error!("send to tun error: {:?}", e);
+                log::error!("send to virtual device error: {:?}", e);
                 return Err(anyhow::anyhow!(e));
             }
         }
@@ -191,13 +256,21 @@ async fn in_tun_loop(
     Ok(())
 }
 
-async fn out_tun_loop(
+async fn out_device_loop(
     mut device_framed_read: DeviceFramedRead<BytesCodec, Arc<AsyncDevice>>,
+    device: Arc<AsyncDevice>,
     enhanced_outbound: EnhancedOutbound,
+    device_mode: DeviceMode,
 ) -> anyhow::Result<()> {
     while let Some(rs) = device_framed_read.next().await {
         let bytes_mut = rs?;
-        enhanced_outbound.ipv4_outbound(bytes_mut).await;
+        if device_mode == DeviceMode::Tap {
+            if let Some(reply) = enhanced_outbound.ethernet_outbound(bytes_mut).await {
+                device.send(reply.as_ref()).await?;
+            }
+        } else {
+            enhanced_outbound.ipv4_outbound(bytes_mut).await;
+        }
     }
     Ok(())
 }

@@ -16,6 +16,7 @@ use crate::tun::TunDataInbound;
 use crate::tunnel_core::outbound::HybridOutbound;
 use crate::utils::task_control::TaskGroup;
 use anyhow::Context;
+use pnet_packet::ipv4::Ipv4Packet;
 use quinn::congestion::BbrConfig;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, default_runtime};
@@ -47,10 +48,7 @@ pub(crate) async fn quic_tunnel_start(
     config: QuicTunnelConfig,
     components: QuicTunnelComponents,
 ) -> anyhow::Result<(EnhancedQuicInbound, Option<EnhancedQuicOutbound>)> {
-    let ip_stack_config = IpStackConfig {
-        mtu: config.mtu,
-        ..Default::default()
-    };
+    let ip_stack_config = IpStackConfig::builder().mtu(config.mtu).build();
     let (ip_stack, ip_socket, quic_outbound) = if let Some(tun_data_sender) = tun_data_sender {
         let (ip_stack, ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(ip_stack_config)?;
         let ip_socket = tcp_ip::ip::IpSocket::bind_all(None, ip_stack.clone()).await?;
@@ -189,7 +187,13 @@ async fn ip_stack_recv_task(
             log::error!("not network");
             break;
         };
-        match tun_data_sender.send((&buf[..len]).into(), &net).await {
+        let Some(ipv4) = Ipv4Packet::new(&buf[..len]) else {
+            continue;
+        };
+        match tun_data_sender
+            .send_ip((&buf[..len]).into(), &net, ipv4.get_source())
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 log::error!("IP stack send error: {:?}", e);

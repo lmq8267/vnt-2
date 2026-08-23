@@ -18,6 +18,7 @@ public class VntConfig {
     private final String deviceId;
     private final String deviceName;
     private final String tunName;
+    private final String outboundInterface;
     private final String ip;
     private final String certMode;
     private final boolean noPunch;
@@ -25,7 +26,7 @@ public class VntConfig {
     private final boolean rtx;
     private final boolean fec;
     private final boolean noNat;
-    private final boolean noTun;
+    private final String deviceMode;
     private final Integer mtu;
     private final boolean allowMapping;
     private final List<String> portMapping;
@@ -39,6 +40,7 @@ public class VntConfig {
         this.deviceId = builder.deviceId;
         this.deviceName = builder.deviceName;
         this.tunName = builder.tunName;
+        this.outboundInterface = builder.outboundInterface;
         this.ip = builder.ip;
         this.certMode = builder.certMode;
         this.noPunch = builder.noPunch;
@@ -46,7 +48,7 @@ public class VntConfig {
         this.rtx = builder.rtx;
         this.fec = builder.fec;
         this.noNat = builder.noNat;
-        this.noTun = builder.noTun;
+        this.deviceMode = builder.deviceMode;
         this.mtu = builder.mtu;
         this.allowMapping = builder.allowMapping;
         this.portMapping = builder.portMapping;
@@ -73,6 +75,7 @@ public class VntConfig {
         if (deviceId != null) json.put("device_id", deviceId);
         if (deviceName != null) json.put("device_name", deviceName);
         if (tunName != null) json.put("tun_name", tunName);
+        if (outboundInterface != null) json.put("outbound_interface", outboundInterface);
         if (ip != null) json.put("ip", ip);
         if (certMode != null) json.put("cert_mode", certMode);
         if (mtu != null) json.put("mtu", mtu);
@@ -83,7 +86,7 @@ public class VntConfig {
         json.put("rtx", rtx);
         json.put("fec", fec);
         json.put("no_nat", noNat);
-        json.put("no_tun", noTun);
+        json.put("device_mode", deviceMode);
         json.put("allow_mapping", allowMapping);
 
         // 数组
@@ -124,6 +127,7 @@ public class VntConfig {
         private String deviceId;
         private String deviceName;
         private String tunName;
+        private String outboundInterface;
         private String ip;
         private String certMode;
         private boolean noPunch = false;
@@ -131,7 +135,7 @@ public class VntConfig {
         private boolean rtx = false;
         private boolean fec = false;
         private boolean noNat = false;
-        private boolean noTun = false;
+        private String deviceMode = "tun";
         private Integer mtu;
         private boolean allowMapping = false;
         private List<String> portMapping = new ArrayList<>();
@@ -185,6 +189,14 @@ public class VntConfig {
          */
         public Builder setTunName(String tunName) {
             this.tunName = tunName;
+            return this;
+        }
+
+        /**
+         * 绑定对外通信Socket的出口网卡名称（可选）
+         */
+        public Builder setOutboundInterface(String outboundInterface) {
+            this.outboundInterface = outboundInterface;
             return this;
         }
 
@@ -246,10 +258,13 @@ public class VntConfig {
         }
 
         /**
-         * 无TUN模式（默认false）
+         * 设置虚拟网卡模式：no、tun（默认）或 tap。
          */
-        public Builder setNoTun(boolean noTun) {
-            this.noTun = noTun;
+        public Builder setDeviceMode(String deviceMode) {
+            if (!"no".equals(deviceMode) && !"tun".equals(deviceMode) && !"tap".equals(deviceMode)) {
+                throw new IllegalArgumentException("deviceMode must be no, tun, or tap");
+            }
+            this.deviceMode = deviceMode;
             return this;
         }
 

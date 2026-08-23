@@ -270,7 +270,8 @@ impl P2pInboundHandler {
                     self.packet_crypto.encrypt_reserve(),
                 ))?;
                 packet.set_msg_type(MsgType::RelayProbeReply);
-                packet.set_ttl(1);
+                // 与 RelayProbe 对称：允许中继一次，到达发起方时 curr_ttl 为 0，metric = 2
+                packet.set_ttl(2);
                 packet.set_src_id(ctx.dest_ip.into());
                 packet.set_dest_id(ctx.src_ip.into());
                 self.packet_crypto.encrypt_in_place(&mut packet)?;
@@ -280,10 +281,8 @@ impl P2pInboundHandler {
             }
             MsgType::RelayProbeReply => {
                 let metric = ctx.max_ttl - ctx.ttl;
-                self.route_table.add_route(
-                    ctx.src_ip,
-                    Route::from_default_rt(route_key, metric),
-                );
+                self.route_table
+                    .add_route(ctx.src_ip, Route::from_default_rt(route_key, metric));
             }
             _ => {}
         }

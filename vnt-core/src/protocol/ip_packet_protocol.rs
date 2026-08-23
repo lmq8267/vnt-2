@@ -2,7 +2,7 @@
    0                                            15                                              31
    0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5  6  7  8  9  0  1
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  | 1 |    msg_type(7)  |max ttl(4) |curr ttl(4)| C | G | R |           reserve(13)             |
+   | 1 |    msg_type(7)  |max ttl(4) |curr ttl(4)| C | G | F | E |        reserve(12)             |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   |                                            seq(32)                                          |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -27,7 +27,7 @@ pub struct NetHeader {
     pub type_byte: u8,
     /// Byte 1: high 4 = max ttl, low 4 = curr ttl
     pub ttl_byte: u8,
-    /// Byte 2: C(0x80) | G(0x40) | reserve
+    /// Byte 2: C(0x80) | G(0x40) | F(0x20) | ETHERNET(0x10) | reserve
     pub flags_byte: u8,
     /// Byte 3: reserve
     pub _reserved: u8,
@@ -39,6 +39,7 @@ pub struct NetHeader {
 const COMPRESSED: u8 = 0x80;
 const GATEWAY: u8 = 0x40;
 const FEC: u8 = 0x20;
+const ETHERNET: u8 = 0x10;
 impl NetHeader {
     #[inline]
     pub fn msg_type(&self) -> u8 {
@@ -140,9 +141,9 @@ impl TryFrom<u8> for MsgType {
             14 => MsgType::RpcReq,
             15 => MsgType::RpcRes,
 
-            16 => MsgType::RelayProbe,
             17 => MsgType::Quic,
-            18 => MsgType::RelayProbeReply,
+            18 => MsgType::RelayProbe,
+            19 => MsgType::RelayProbeReply,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -210,6 +211,9 @@ impl<B: AsRef<[u8]>> NetPacket<B> {
     pub fn is_fec(&self) -> bool {
         (self.header().flags_byte & FEC) != 0
     }
+    pub fn is_ethernet(&self) -> bool {
+        (self.header().flags_byte & ETHERNET) != 0
+    }
     pub fn head(&self) -> &[u8] {
         &self.buffer.as_ref()[..HEAD_LENGTH]
     }
@@ -258,6 +262,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> NetPacket<B> {
     pub fn set_fec_flag(&mut self, fec: bool) {
         self.header_mut().set_flag(FEC, fec);
     }
+    pub fn set_ethernet_flag(&mut self, ethernet: bool) {
+        self.header_mut().set_flag(ETHERNET, ethernet);
+    }
 
     pub fn set_payload(&mut self, data: &[u8]) -> io::Result<()> {
         let buf = self.buffer.as_mut();
@@ -302,5 +309,79 @@ impl NetPacket<TransmissionBytes> {
         NetPacket {
             buffer: self.buffer.into_bytes().freeze(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msg_type_round_trip() {
+        let all = [
+            MsgType::Turn,
+            MsgType::Broadcast,
+            MsgType::ExcludeBroadcast,
+            MsgType::TargetBroadcast,
+            MsgType::Ping,
+            MsgType::Pong,
+            MsgType::PingTurn,
+            MsgType::PongTurn,
+            MsgType::PunchStart1,
+            MsgType::PunchStart2,
+            MsgType::PunchReq,
+            MsgType::PunchRes,
+            MsgType::PushClientIps,
+            MsgType::RpcReq,
+            MsgType::RpcRes,
+            MsgType::Quic,
+            MsgType::RelayProbe,
+            MsgType::RelayProbeReply,
+        ];
+        for msg_type in all {
+            let byte = u8::from(msg_type);
+            assert_eq!(
+                MsgType::try_from(byte).unwrap(),
+                msg_type,
+                "round trip failed for {msg_type:?} ({byte})"
+            );
+        }
+        // 未分配的取值必须报错
+        assert!(MsgType::try_from(0u8).is_err());
+        assert!(MsgType::try_from(16u8).is_err());
+        assert!(MsgType::try_from(20u8).is_err());
+    }
+
+    #[test]
+    fn ethernet_flag_round_trip() {
+        let mut packet = NetPacket::new(BytesMut::from(&[0u8; HEAD_LENGTH][..])).unwrap();
+        assert!(!packet.is_ethernet());
+        packet.set_ethernet_flag(true);
+        assert!(packet.is_ethernet());
+        packet.set_fec_flag(true);
+        assert!(packet.is_ethernet());
+        packet.set_ethernet_flag(false);
+        assert!(!packet.is_ethernet());
+        assert!(packet.is_fec());
+    }
+
+    /// 中继转发语义：包每经过一跳 curr_ttl 减 1，curr_ttl >= 1 时才继续转发，
+    /// 接收方以 metric = max_ttl - curr_ttl 计算路由距离。
+    #[test]
+    fn relay_reply_survives_one_hop() {
+        let mut packet = NetPacket::new(BytesMut::from(&[0u8; HEAD_LENGTH][..])).unwrap();
+        packet.set_msg_type(MsgType::RelayProbeReply);
+        // 目标方回复时 TTL 必须允许一次中继
+        packet.set_ttl(2);
+
+        // 中继节点：decr 后 curr_ttl == 1，满足转发条件 ttl >= 1
+        packet.decr_ttl();
+        assert_eq!(packet.ttl(), 1);
+        assert!(packet.ttl() >= 1, "relay node would drop this packet");
+
+        // 发起方：decr 后 curr_ttl == 0，metric = 2（经由一个中继）
+        packet.decr_ttl();
+        assert_eq!(packet.ttl(), 0);
+        assert_eq!(packet.max_ttl() - packet.ttl(), 2);
     }
 }
