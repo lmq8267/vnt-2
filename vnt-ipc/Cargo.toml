@@ -1,7 +1,8 @@
 [package]
 name = "vnt-ipc"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 
