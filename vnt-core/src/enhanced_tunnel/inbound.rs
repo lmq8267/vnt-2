@@ -1,13 +1,15 @@
 use crate::context::config::DeviceMode;
 use crate::context::{NetworkAddr, TrafficStats};
 use crate::enhanced_tunnel::quic_over::quic_inbound::EnhancedQuicInbound;
-use crate::ethernet::{ETHERTYPE_IPV4, build_arp_reply, parse_arp_ipv4, parse_frame};
+use crate::ethernet::{MacTable, build_arp_reply, parse_arp_ipv4, parse_frame};
 use crate::nat::internal_nat::InternalNatInbound;
 use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
 use crate::protocol::transmission::TransmissionBytes;
 use crate::tun::enhanced_tun::EnhancedTunInbound;
 use crate::tunnel_core::outbound::HybridOutbound;
 use anyhow::{Context, bail};
+use pnet_packet::arp::ArpOperations;
+use pnet_packet::ethernet::EtherTypes;
 use pnet_packet::ipv4::Ipv4Packet;
 use std::net::Ipv4Addr;
 
@@ -19,6 +21,7 @@ pub(crate) struct EnhancedInbound {
     traffic_stats: TrafficStats,
     device_mode: DeviceMode,
     hybrid_outbound: HybridOutbound,
+    mac_table: MacTable,
 }
 
 impl EnhancedInbound {
@@ -29,6 +32,7 @@ impl EnhancedInbound {
         traffic_stats: TrafficStats,
         device_mode: DeviceMode,
         hybrid_outbound: HybridOutbound,
+        mac_table: MacTable,
     ) -> Self {
         Self {
             tun_data_inbound,
@@ -37,6 +41,7 @@ impl EnhancedInbound {
             traffic_stats,
             device_mode,
             hybrid_outbound,
+            mac_table,
         }
     }
     pub async fn inbound(
@@ -51,12 +56,18 @@ impl EnhancedInbound {
         self.traffic_stats.record_rx(src, buf.len() as u64);
         buf.advance_head(HEAD_LENGTH)?;
 
-        if ethernet && parse_frame(buf.as_ref()).is_none() {
-            return Ok(());
-        }
+        let ethernet_frame = if ethernet {
+            let Some(frame) = parse_frame(buf.as_ref()) else {
+                return Ok(());
+            };
+            self.mac_table.learn_remote(frame.source, src);
+            Some(frame)
+        } else {
+            None
+        };
         if ethernet && self.device_mode != DeviceMode::Tap {
             if let Some(arp) = parse_arp_ipv4(buf.as_ref())
-                && arp.operation == 1
+                && arp.operation == ArpOperations::Request
                 && arp.target_ip == network_addr.ip
             {
                 if let Some(reply) = build_arp_reply(buf.as_ref(), network_addr.ip) {
@@ -66,7 +77,7 @@ impl EnhancedInbound {
                 }
                 return Ok(());
             }
-            if parse_frame(buf.as_ref()).is_none_or(|frame| frame.ethertype != ETHERTYPE_IPV4) {
+            if ethernet_frame.is_none_or(|frame| frame.ethertype != EtherTypes::Ipv4) {
                 return Ok(());
             }
         }
@@ -75,10 +86,10 @@ impl EnhancedInbound {
             MsgType::Turn => {
                 if let Some(internal_nat_inbound) = self.internal_nat_inbound.as_ref() {
                     let ip_data = if ethernet {
-                        let Some(frame) = parse_frame(buf.as_ref()) else {
+                        let Some(frame) = ethernet_frame else {
                             return Ok(());
                         };
-                        if frame.ethertype != ETHERTYPE_IPV4 {
+                        if frame.ethertype != EtherTypes::Ipv4 {
                             self.tun_data_inbound
                                 .inbound(buf, network_addr, src, true)
                                 .await?;

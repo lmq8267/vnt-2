@@ -19,7 +19,7 @@ const message = ref("");
 const downloaded = ref(0);
 const contentLength = ref(0);
 
-const currentVersion = computed(() => app.version || "2.0.3");
+const currentVersion = computed(() => app.version || "2.0.4");
 const progress = computed(() => {
   if (!contentLength.value) return 0;
   return Math.min(100, Math.round((downloaded.value / contentLength.value) * 100));
@@ -41,8 +41,8 @@ const compareVersions = (left, right) => {
 };
 
 const openUrl = async (url) => {
-  if (globalThis.__VNT_WEB_ACCESS__?.openUrl) {
-    await globalThis.__VNT_WEB_ACCESS__.openUrl(url);
+  if (globalThis.__VNT_SETTINGS__?.openUrl) {
+    await globalThis.__VNT_SETTINGS__.openUrl(url);
   } else {
     window.open(url, "_blank", "noopener,noreferrer");
   }
@@ -220,7 +220,7 @@ onMounted(async () => {
         <button v-else-if="updateInfo?.manualOnly || runtime === 'standalone_web'" class="btn-ghost" type="button" @click="openUrl(updateInfo?.url || RELEASES_URL)">查看发布版本</button>
       </div>
 
-      <p v-if="isDesktop" class="mt-4 text-xs leading-5 text-slate-400">安装更新时桌面客户端可能自动退出，完成后将重新启动。</p>
+      <p v-if="isDesktop" class="mt-4 text-xs leading-5 text-slate-400">安装更新时桌面客户端可能自动退出，完成后将重新启动；已安装的 VNT Web 服务也会同步更新并恢复运行。</p>
     </section>
   </div>
 </template>
