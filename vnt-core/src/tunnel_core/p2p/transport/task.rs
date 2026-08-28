@@ -1,3 +1,4 @@
+use crate::context::config::PeerAddress;
 use crate::context::nat::MyNatInfo;
 use crate::context::{AppState, PacketLossStats, SharedNetworkAddr};
 use crate::crypto::PacketCrypto;
@@ -13,22 +14,30 @@ use crate::tunnel_core::p2p::transport::punch::{PunchTaskContext, punch_task};
 use crate::tunnel_core::server::outbound::ServerOutbound;
 use crate::utils::task_control::TaskGroup;
 use rust_p2p_core::punch::Puncher;
+use rust_p2p_core::route::ConnectProtocol;
 use rust_p2p_core::socket::LocalInterface;
 use rust_p2p_core::tunnel::{Tunnel, TunnelDispatcher, new_tunnel_component};
-use std::net::Ipv4Addr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub(crate) struct P2pInitConfig {
+    pub tunnel_port: Option<u16>,
+    pub automatic_punch: bool,
+    pub peer_address: Vec<PeerAddress>,
+    pub default_interface: Option<LocalInterface>,
+    pub outbound_interface_name: Option<String>,
+}
 
 pub async fn init_tunnel(
     task_group: TaskGroup,
     app_state: AppState,
     tunnel_to_server: ServerOutbound,
     packet_crypto: PacketCrypto,
-    tunnel_port: Option<u16>,
-    default_interface: Option<LocalInterface>,
-    outbound_interface_name: Option<String>,
+    config: P2pInitConfig,
 ) -> anyhow::Result<(Puncher, P2pOutbound, P2pTask)> {
-    let tunnel_port = tunnel_port.unwrap_or(0);
+    let tunnel_port = config.tunnel_port.unwrap_or(0);
     let mut udp_config = rust_p2p_core::tunnel::config::UdpTunnelConfig::default()
         .set_main_udp_count(2)
         .set_sub_udp_count(82)
@@ -38,7 +47,7 @@ pub async fn init_tunnel(
     ))
     .set_tcp_multiplexing_limit(2)
     .set_tcp_port(tunnel_port);
-    if let Some(interface) = default_interface.clone() {
+    if let Some(interface) = config.default_interface.clone() {
         // rust-p2p-core 当前的接口绑定实现针对 IPv4；指定出口网卡时关闭
         // 未绑定的 IPv6 Socket，避免流量绕过所选网卡。
         udp_config = udp_config
@@ -48,41 +57,45 @@ pub async fn init_tunnel(
             .set_default_interface(interface)
             .set_use_v6(false);
     }
-    let config = rust_p2p_core::tunnel::config::TunnelConfig::empty()
+    let tunnel_config = rust_p2p_core::tunnel::config::TunnelConfig::empty()
         .set_udp_tunnel_config(udp_config)
         .set_tcp_tunnel_config(tcp_config);
-    let (tunnel_dispatcher, puncher) = new_tunnel_component(config)?;
+    let (tunnel_dispatcher, puncher) = new_tunnel_component(tunnel_config)?;
     let route_table = app_state.route_table.clone();
     let socket_manager = P2pOutbound::new(
         tunnel_dispatcher.socket_manager(),
         route_table.clone(),
         packet_crypto,
     );
-    task_group.spawn(my_nat_info(
-        app_state.clone(),
-        tunnel_dispatcher.socket_manager(),
-        default_interface,
-        outbound_interface_name,
-    ));
-    let manager = tunnel_dispatcher.socket_manager();
-    task_group.spawn(query_udp_public_addr_loop(
-        app_state.clone(),
-        manager.clone(),
-    ));
-    task_group.spawn(query_tcp_public_addr_loop(app_state.clone(), manager));
+    if config.automatic_punch {
+        task_group.spawn(my_nat_info(
+            app_state.clone(),
+            tunnel_dispatcher.socket_manager(),
+            config.default_interface,
+            config.outbound_interface_name,
+        ));
+        let manager = tunnel_dispatcher.socket_manager();
+        task_group.spawn(query_udp_public_addr_loop(
+            app_state.clone(),
+            manager.clone(),
+        ));
+        task_group.spawn(query_tcp_public_addr_loop(app_state.clone(), manager));
+    }
 
     task_group.spawn(route_timeout_task(
         route_table.clone(),
         app_state.packet_loss_stats.clone(),
     ));
-    let app_state_for_punch = app_state.clone();
-    let punch_ctx = PunchTaskContext {
-        network: app_state.network.clone(),
-        server_info: app_state.server_info_collection.clone(),
-        punch_backoff: app_state.punch_backoff.clone(),
-        punch_info_getter: Arc::new(move || app_state_for_punch.get_punch_info()),
-    };
-    task_group.spawn(punch_task(tunnel_to_server, route_table.clone(), punch_ctx));
+    if config.automatic_punch {
+        let app_state_for_punch = app_state.clone();
+        let punch_ctx = PunchTaskContext {
+            network: app_state.network.clone(),
+            server_info: app_state.server_info_collection.clone(),
+            punch_backoff: app_state.punch_backoff.clone(),
+            punch_info_getter: Arc::new(move || app_state_for_punch.get_punch_info()),
+        };
+        task_group.spawn(punch_task(tunnel_to_server, route_table.clone(), punch_ctx));
+    }
     task_group.spawn(ping_all(
         app_state.network.clone(),
         app_state.packet_loss_stats.clone(),
@@ -91,10 +104,23 @@ pub async fn init_tunnel(
     ));
     task_group.spawn(relay_probe_task(
         app_state.network.clone(),
-        app_state.server_info_collection.clone(),
         route_table.clone(),
         socket_manager.clone(),
     ));
+    let endpoints: HashSet<_> = config
+        .peer_address
+        .iter()
+        .flat_map(PeerAddress::endpoints)
+        .collect();
+    for (protocol, address) in endpoints {
+        task_group.spawn(direct_peer_probe_task(
+            app_state.network.clone(),
+            route_table.clone(),
+            socket_manager.clone(),
+            protocol,
+            address,
+        ));
+    }
     let p2p_task = P2pTask {
         task_group,
         nat_info: app_state.nat_info.clone(),
@@ -102,6 +128,52 @@ pub async fn init_tunnel(
         tunnel_dispatcher,
     };
     Ok((puncher, socket_manager, p2p_task))
+}
+
+async fn direct_peer_probe_task(
+    network: SharedNetworkAddr,
+    route_table: RouteTable,
+    socket_manager: P2pOutbound,
+    protocol: ConnectProtocol,
+    address: SocketAddr,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(src_ip) = network.ip() else {
+            continue;
+        };
+        if route_table.has_direct_endpoint(protocol, address) {
+            continue;
+        }
+        let packet = match build_direct_peer_probe(src_ip, socket_manager.encrypt_reserve()) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::warn!("failed to build direct peer probe for {protocol}://{address}: {error}");
+                continue;
+            }
+        };
+        if let Err(error) = socket_manager.send_to_addr(packet, protocol, address).await {
+            log::debug!("direct peer probe failed for {protocol}://{address}: {error:?}");
+        }
+    }
+}
+
+fn build_direct_peer_probe(
+    src_ip: Ipv4Addr,
+    encrypt_reserve: usize,
+) -> anyhow::Result<NetPacket<TransmissionBytes>> {
+    let mut packet = NetPacket::new(TransmissionBytes::zeroed_size(
+        HEAD_LENGTH + 8,
+        encrypt_reserve,
+    ))?;
+    packet.set_msg_type(MsgType::DirectConnectReq);
+    packet.set_ttl(1);
+    packet.set_src_id(src_ip.into());
+    packet.set_dest_id(Ipv4Addr::UNSPECIFIED.into());
+    packet.set_payload(&crate::utils::time::now_ts_ms().to_be_bytes())?;
+    Ok(packet)
 }
 pub struct P2pTask {
     task_group: TaskGroup,
@@ -139,21 +211,18 @@ pub async fn ping_all(
                 if index > 2 {
                     break;
                 }
-                let Ok(mut ping) = NetPacket::new(TransmissionBytes::zeroed_size(
-                    HEAD_LENGTH + 8,
+                let ping = match build_route_ping(
+                    src,
+                    id,
+                    route.metric(),
                     socket_manager.encrypt_reserve(),
-                )) else {
-                    continue;
+                ) {
+                    Ok(ping) => ping,
+                    Err(error) => {
+                        log::warn!("failed to build route probe: {error}");
+                        continue;
+                    }
                 };
-                ping.set_msg_type(MsgType::Ping);
-                ping.set_ttl(1);
-                ping.set_src_id(src.into());
-                ping.set_dest_id(id.into());
-                if let Err(error) = ping.set_payload(&crate::utils::time::now_ts_ms().to_be_bytes())
-                {
-                    log::warn!("failed to build route probe: {error}");
-                    continue;
-                }
                 let route_key = route.route_key();
                 if socket_manager.send_to(ping, &route_key).await.is_ok() {
                     packet_loss_stats.record_sent(id, route_key);
@@ -162,6 +231,24 @@ pub async fn ping_all(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+}
+
+fn build_route_ping(
+    src: Ipv4Addr,
+    target: Ipv4Addr,
+    metric: u8,
+    encrypt_reserve: usize,
+) -> anyhow::Result<NetPacket<TransmissionBytes>> {
+    let mut ping = NetPacket::new(TransmissionBytes::zeroed_size(
+        HEAD_LENGTH + 8,
+        encrypt_reserve,
+    ))?;
+    ping.set_msg_type(MsgType::Ping);
+    ping.set_ttl(metric);
+    ping.set_src_id(src.into());
+    ping.set_dest_id(target.into());
+    ping.set_payload(&crate::utils::time::now_ts_ms().to_be_bytes())?;
+    Ok(ping)
 }
 pub async fn route_timeout_task(route_table: RouteTable, packet_loss_stats: PacketLossStats) {
     loop {
@@ -174,127 +261,294 @@ pub async fn route_timeout_task(route_table: RouteTable, packet_loss_stats: Pack
     }
 }
 
-/// 客户端中继探测任务
-/// 每5分钟执行一次，找到所有未直连的目标IP，通过Ping消息发送给已打洞的客户端
-pub async fn relay_probe_task(
-    network: SharedNetworkAddr,
-    server_info: crate::context::ServerInfoCollection,
-    route_table: RouteTable,
-    socket_manager: P2pOutbound,
-) {
-    use rand::prelude::*;
+const RELAY_ROUTE_TARGET: usize = 3;
+const RELAY_TARGETS_PER_BATCH: usize = 10;
+const RELAY_PROBES_PER_TARGET: usize = 3;
+const RELAY_RESPONSE_WAIT: Duration = Duration::from_secs(2);
+const RELAY_START_DELAY: Duration = Duration::from_secs(10);
+const RELAY_RECONCILE_INTERVAL: Duration = Duration::from_secs(120);
+const RELAY_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+const RELAY_PROBE_RATE: f64 = 30.0;
+const RELAY_PROBE_BURST: f64 = 30.0;
 
-    loop {
-        tokio::time::sleep(Duration::from_secs(300)).await; // 5分钟
+#[derive(Clone, Copy, Debug)]
+struct RelayCandidate {
+    ip: Ipv4Addr,
+    route_key: rust_p2p_core::route::RouteKey,
+}
 
-        let Some(src) = network.ip() else {
-            continue;
-        };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelayProbeAction {
+    target_ip: Ipv4Addr,
+    relay_ip: Ipv4Addr,
+    route_key: rust_p2p_core::route::RouteKey,
+}
 
-        let online_ips = server_info.client_online_ips();
-        if online_ips.is_empty() {
-            continue;
+#[derive(Debug)]
+struct RelayTargetState {
+    relay_count: usize,
+    attempted_relays: HashSet<Ipv4Addr>,
+    next_attempt: Instant,
+    backoff_index: usize,
+}
+
+#[derive(Debug)]
+struct RelayProbeScheduler {
+    states: HashMap<Ipv4Addr, RelayTargetState>,
+    queue: VecDeque<Ipv4Addr>,
+    known_direct_peers: HashSet<Ipv4Addr>,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RelayProbeScheduler {
+    fn new(now: Instant) -> Self {
+        Self {
+            states: HashMap::new(),
+            queue: VecDeque::new(),
+            known_direct_peers: HashSet::new(),
+            tokens: RELAY_PROBE_BURST,
+            last_refill: now,
+        }
+    }
+
+    fn plan(
+        &mut self,
+        now: Instant,
+        src: Ipv4Addr,
+        routes: &[(Ipv4Addr, Vec<crate::tunnel_core::p2p::route_table::Route>)],
+    ) -> Vec<RelayProbeAction> {
+        self.refill(now);
+
+        let mut candidates = routes
+            .iter()
+            .filter_map(|(ip, list)| {
+                list.iter()
+                    .filter(|route| route.is_direct())
+                    .max_by_key(|route| route.score())
+                    .map(|route| RelayCandidate {
+                        ip: *ip,
+                        route_key: route.route_key(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| candidate.ip);
+
+        let direct_peer_ips: HashSet<_> = candidates.iter().map(|candidate| candidate.ip).collect();
+        let has_new_direct_peer = direct_peer_ips
+            .iter()
+            .any(|ip| !self.known_direct_peers.contains(ip));
+        self.known_direct_peers = direct_peer_ips.clone();
+
+        let mut eligible = HashMap::new();
+        for (ip, list) in routes {
+            if *ip == src {
+                continue;
+            }
+            if list.iter().any(|route| route.is_direct()) {
+                continue;
+            }
+            let relay_count = list.iter().filter(|route| !route.is_direct()).count();
+            if relay_count < RELAY_ROUTE_TARGET {
+                eligible.insert(*ip, relay_count);
+            }
         }
 
-        let mut non_direct_targets = Vec::new();
-        for ip in online_ips {
-            if ip == src {
+        self.states.retain(|ip, _| eligible.contains_key(ip));
+        self.queue.retain(|ip| self.states.contains_key(ip));
+
+        for (ip, relay_count) in eligible {
+            if let Some(state) = self.states.get_mut(&ip) {
+                state
+                    .attempted_relays
+                    .retain(|relay_ip| direct_peer_ips.contains(relay_ip));
+                if relay_count < state.relay_count {
+                    state.attempted_relays.clear();
+                    state.next_attempt = now;
+                    state.backoff_index = 0;
+                } else if relay_count > state.relay_count {
+                    state.backoff_index = 0;
+                }
+                if has_new_direct_peer {
+                    state.next_attempt = now;
+                    state.backoff_index = 0;
+                }
+                state.relay_count = relay_count;
+            } else {
+                self.states.insert(
+                    ip,
+                    RelayTargetState {
+                        relay_count,
+                        attempted_relays: HashSet::new(),
+                        next_attempt: now,
+                        backoff_index: 0,
+                    },
+                );
+                self.queue.push_back(ip);
+            }
+        }
+
+        let mut actions = Vec::new();
+        let mut visited = 0;
+        let queue_len = self.queue.len();
+        let mut processed_targets = 0;
+        while visited < queue_len
+            && processed_targets < RELAY_TARGETS_PER_BATCH
+            && self.tokens >= 1.0
+        {
+            let Some(target_ip) = self.queue.pop_front() else {
+                break;
+            };
+            visited += 1;
+            let Some(state) = self.states.get_mut(&target_ip) else {
+                continue;
+            };
+
+            if state.next_attempt > now {
+                self.queue.push_back(target_ip);
                 continue;
             }
 
-            let is_direct = route_table
-                .get_route_by_id(&ip)
-                .ok()
-                .map(|route| route.is_direct())
-                .unwrap_or(false);
+            let missing_routes = RELAY_ROUTE_TARGET.saturating_sub(state.relay_count);
+            let available = rotated_candidates(&candidates, target_ip)
+                .filter(|candidate| !state.attempted_relays.contains(&candidate.ip))
+                .take(
+                    missing_routes
+                        .min(RELAY_PROBES_PER_TARGET)
+                        .min(self.tokens.floor() as usize),
+                )
+                .copied()
+                .collect::<Vec<_>>();
 
-            if !is_direct {
-                non_direct_targets.push(ip);
-                if non_direct_targets.len() >= 20 {
-                    break;
-                }
+            if available.is_empty() {
+                state.attempted_relays.clear();
+                let delay = RELAY_BACKOFF[state.backoff_index.min(RELAY_BACKOFF.len() - 1)];
+                state.backoff_index = (state.backoff_index + 1).min(RELAY_BACKOFF.len() - 1);
+                state.next_attempt = now + delay;
+                self.queue.push_back(target_ip);
+                continue;
             }
-        }
 
-        if non_direct_targets.is_empty() {
-            continue;
-        }
-
-        let non_direct_count = non_direct_targets.len();
-
-        let targets_to_probe: Vec<Ipv4Addr> = {
-            let mut rng = rand::rng();
-            if non_direct_targets.len() <= 10 {
-                non_direct_targets
-            } else {
-                non_direct_targets.sample(&mut rng, 10).copied().collect()
+            for candidate in available {
+                state.attempted_relays.insert(candidate.ip);
+                actions.push(RelayProbeAction {
+                    target_ip,
+                    relay_ip: candidate.ip,
+                    route_key: candidate.route_key,
+                });
+                self.tokens -= 1.0;
             }
-        };
-
-        let all_routes = route_table.route_table();
-        let mut direct_peers = Vec::new();
-        for (ip, routes) in &all_routes {
-            if let Some(best_route) = routes.first()
-                && best_route.is_direct()
-            {
-                direct_peers.push((*ip, best_route.route_key()));
-            }
+            state.next_attempt = now + RELAY_RESPONSE_WAIT;
+            processed_targets += 1;
+            self.queue.push_back(target_ip);
         }
 
-        if direct_peers.is_empty() {
-            log::debug!("No direct peers available for relay probe");
-            continue;
+        actions
+    }
+
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let deadline = self.states.values().map(|state| state.next_attempt).min()?;
+        if deadline <= now && self.tokens < 1.0 {
+            let wait = (1.0 - self.tokens) / RELAY_PROBE_RATE;
+            Some(now + Duration::from_secs_f64(wait.max(0.001)))
+        } else {
+            Some(deadline)
         }
+    }
 
-        let max_probes_per_target = 3.min(direct_peers.len());
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * RELAY_PROBE_RATE).min(RELAY_PROBE_BURST);
+        self.last_refill = now;
+    }
+}
 
-        for target_ip in &targets_to_probe {
-            let selected_peers: Vec<_> = {
-                let mut rng = rand::rng();
-                direct_peers
-                    .iter()
-                    .filter(|(ip, _)| ip != target_ip)
-                    .sample(&mut rng, max_probes_per_target)
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            };
+fn rotated_candidates(
+    candidates: &[RelayCandidate],
+    target_ip: Ipv4Addr,
+) -> impl Iterator<Item = &RelayCandidate> {
+    let start = if candidates.is_empty() {
+        0
+    } else {
+        u32::from(target_ip) as usize % candidates.len()
+    };
+    candidates[start..].iter().chain(candidates[..start].iter())
+}
 
-            for (relay_ip, route_key) in selected_peers {
-                // 构造RelayProbe消息，目标是target_ip，但发送给relay_ip
-                let Ok(mut probe) = NetPacket::new(TransmissionBytes::zeroed_size(
-                    HEAD_LENGTH,
+fn build_relay_probe(
+    src: Ipv4Addr,
+    target: Ipv4Addr,
+    encrypt_reserve: usize,
+) -> anyhow::Result<NetPacket<TransmissionBytes>> {
+    let mut probe = NetPacket::new(TransmissionBytes::zeroed_size(HEAD_LENGTH, encrypt_reserve))?;
+    probe.set_msg_type(MsgType::RelayProbe);
+    probe.set_ttl(2);
+    probe.set_src_id(src.into());
+    probe.set_dest_id(target.into());
+    Ok(probe)
+}
+
+/// 事件驱动的客户端中继探测任务。
+pub async fn relay_probe_task(
+    network: SharedNetworkAddr,
+    route_table: RouteTable,
+    socket_manager: P2pOutbound,
+) {
+    let first_direct_route = route_table.first_direct_route_notify();
+    tokio::time::sleep(RELAY_START_DELAY).await;
+    let mut reconcile = tokio::time::interval_at(
+        tokio::time::Instant::now() + RELAY_RECONCILE_INTERVAL,
+        RELAY_RECONCILE_INTERVAL,
+    );
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut scheduler = RelayProbeScheduler::new(Instant::now());
+    loop {
+        let now = Instant::now();
+        if let Some(src) = network.ip() {
+            let routes = route_table.route_table();
+            let actions = scheduler.plan(now, src, &routes);
+            for action in actions {
+                let probe = match build_relay_probe(
+                    src,
+                    action.target_ip,
                     socket_manager.encrypt_reserve(),
-                )) else {
-                    continue;
+                ) {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        log::warn!("failed to build relay probe: {error}");
+                        continue;
+                    }
                 };
-
-                probe.set_msg_type(MsgType::RelayProbe);
-                probe.set_ttl(2); // TTL设为2，允许中继一次
-                probe.set_src_id(src.into());
-                probe.set_dest_id((*target_ip).into());
-
-                // 发送给已打洞的客户端，让它中继到目标
-                if let Err(e) = socket_manager.send_to(probe, &route_key).await {
+                if let Err(error) = socket_manager.try_send_to(probe, &action.route_key) {
                     log::debug!(
-                        "Failed to send relay probe to {} for target {}: {:?}",
-                        relay_ip,
-                        target_ip,
-                        e
+                        "failed to send relay probe through {} for {}: {error:?}",
+                        action.relay_ip,
+                        action.target_ip
                     );
                 }
             }
-
-            // 控制发送速率，避免网络拥塞
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        log::info!(
-            "Relay probe task completed: {} targets probed (from {} non-direct), {} direct peers",
-            targets_to_probe.len(),
-            non_direct_count,
-            direct_peers.len()
-        );
+        let retry = async {
+            if let Some(deadline) = scheduler.next_deadline(Instant::now()) {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(retry);
+        tokio::select! {
+            _ = first_direct_route.notified() => {}
+            _ = reconcile.tick() => {}
+            _ = &mut retry => {}
+        }
     }
 }
 
@@ -353,5 +607,192 @@ pub async fn tunnel_dispatch_task(
                 p2p_inbound_handler.tcp_disconnect(tcp.route_key()).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct_peer(ip: Ipv4Addr) -> (Ipv4Addr, Vec<crate::tunnel_core::p2p::route_table::Route>) {
+        (
+            ip,
+            vec![crate::tunnel_core::p2p::route_table::Route::from(
+                rust_p2p_core::route::RouteKey::default(),
+                1,
+                10,
+            )],
+        )
+    }
+
+    fn relay_route() -> crate::tunnel_core::p2p::route_table::Route {
+        crate::tunnel_core::p2p::route_table::Route::from(
+            rust_p2p_core::route::RouteKey::default(),
+            2,
+            20,
+        )
+    }
+
+    fn relay_target(
+        ip: Ipv4Addr,
+        route_count: usize,
+    ) -> (Ipv4Addr, Vec<crate::tunnel_core::p2p::route_table::Route>) {
+        (ip, vec![relay_route(); route_count])
+    }
+
+    #[test]
+    fn direct_peer_probe_uses_unspecified_destination() {
+        let source = Ipv4Addr::new(10, 26, 0, 2);
+        let packet = build_direct_peer_probe(source, 0).unwrap();
+        assert_eq!(packet.msg_type().unwrap(), MsgType::DirectConnectReq);
+        assert_eq!(Ipv4Addr::from(packet.src_id()), source);
+        assert_eq!(Ipv4Addr::from(packet.dest_id()), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(packet.max_ttl(), 1);
+        assert_eq!(packet.ttl(), 1);
+        assert_eq!(packet.payload().len(), 8);
+    }
+
+    #[test]
+    fn relay_probe_packet_uses_two_hop_route() {
+        let source = Ipv4Addr::new(10, 26, 0, 2);
+        let target = Ipv4Addr::new(10, 26, 0, 9);
+        let packet = build_relay_probe(source, target, 0).unwrap();
+        assert_eq!(packet.msg_type().unwrap(), MsgType::RelayProbe);
+        assert_eq!(Ipv4Addr::from(packet.src_id()), source);
+        assert_eq!(Ipv4Addr::from(packet.dest_id()), target);
+        assert_eq!(packet.max_ttl(), 2);
+        assert_eq!(packet.ttl(), 2);
+    }
+
+    #[test]
+    fn relay_route_ping_uses_route_metric_as_ttl() {
+        let source = Ipv4Addr::new(10, 26, 0, 2);
+        let target = Ipv4Addr::new(10, 26, 0, 9);
+        let packet = build_route_ping(source, target, 2, 0).unwrap();
+        assert_eq!(packet.msg_type().unwrap(), MsgType::Ping);
+        assert_eq!(packet.max_ttl(), 2);
+        assert_eq!(packet.ttl(), 2);
+    }
+
+    #[test]
+    fn relay_scheduler_fairly_covers_more_than_twenty_targets() {
+        let now = Instant::now();
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        let relay = Ipv4Addr::new(10, 0, 0, 2);
+        let mut routes = vec![direct_peer(relay)];
+        routes.extend((10..40).map(|last| relay_target(Ipv4Addr::new(10, 0, 0, last), 1)));
+        let mut scheduler = RelayProbeScheduler::new(now);
+        let mut probed = HashSet::new();
+
+        for _ in 0..3 {
+            for action in scheduler.plan(now, source, &routes) {
+                probed.insert(action.target_ip);
+            }
+        }
+
+        assert_eq!(probed.len(), 30);
+    }
+
+    #[test]
+    fn relay_scheduler_uses_direct_route_even_when_it_is_not_first() {
+        let now = Instant::now();
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        let relay = Ipv4Addr::new(10, 0, 0, 2);
+        let target = Ipv4Addr::new(10, 0, 0, 9);
+        let routes = vec![
+            (
+                relay,
+                vec![
+                    relay_route(),
+                    crate::tunnel_core::p2p::route_table::Route::from(
+                        rust_p2p_core::route::RouteKey::default(),
+                        1,
+                        10,
+                    ),
+                ],
+            ),
+            relay_target(target, 1),
+        ];
+        let mut scheduler = RelayProbeScheduler::new(now);
+
+        let actions = scheduler.plan(now, source, &routes);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].relay_ip, relay);
+    }
+
+    #[test]
+    fn relay_scheduler_stops_at_three_routes_and_restarts_after_loss() {
+        let now = Instant::now();
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        let relay = Ipv4Addr::new(10, 0, 0, 2);
+        let target = Ipv4Addr::new(10, 0, 0, 9);
+        let complete_routes = vec![
+            direct_peer(relay),
+            (target, vec![relay_route(), relay_route(), relay_route()]),
+        ];
+        let mut scheduler = RelayProbeScheduler::new(now);
+
+        assert!(scheduler.plan(now, source, &complete_routes).is_empty());
+
+        let reduced_routes = vec![direct_peer(relay), relay_target(target, 2)];
+        let actions = scheduler.plan(now, source, &reduced_routes);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target_ip, target);
+    }
+
+    #[test]
+    fn relay_scheduler_rotates_candidates_before_backoff() {
+        let now = Instant::now();
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        let target = Ipv4Addr::new(10, 0, 0, 9);
+        let mut routes = (2..6)
+            .map(|last| direct_peer(Ipv4Addr::new(10, 0, 0, last)))
+            .collect::<Vec<_>>();
+        routes.push(relay_target(target, 1));
+        let mut scheduler = RelayProbeScheduler::new(now);
+
+        let first = scheduler.plan(now, source, &routes);
+        let second = scheduler.plan(now + RELAY_RESPONSE_WAIT, source, &routes);
+        let attempted: HashSet<_> = first
+            .iter()
+            .chain(second.iter())
+            .map(|action| action.relay_ip)
+            .collect();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(attempted.len(), 4);
+
+        assert!(
+            scheduler
+                .plan(now + RELAY_RESPONSE_WAIT * 2, source, &routes)
+                .is_empty()
+        );
+        assert_eq!(
+            scheduler.next_deadline(now + RELAY_RESPONSE_WAIT * 2),
+            Some(now + RELAY_RESPONSE_WAIT * 2 + RELAY_BACKOFF[0])
+        );
+    }
+
+    #[test]
+    fn relay_scheduler_limits_each_batch_to_thirty_packets() {
+        let now = Instant::now();
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        let mut routes = (2..12)
+            .map(|last| direct_peer(Ipv4Addr::new(10, 0, 0, last)))
+            .collect::<Vec<_>>();
+        routes.extend((100..120).map(|last| relay_target(Ipv4Addr::new(10, 0, 0, last), 1)));
+        let mut scheduler = RelayProbeScheduler::new(now);
+
+        let first = scheduler.plan(now, source, &routes);
+        let second = scheduler.plan(now, source, &routes);
+        assert_eq!(first.len(), 20);
+        assert_eq!(second.len(), 10);
+        assert!(scheduler.plan(now, source, &routes).is_empty());
+        assert!(
+            scheduler
+                .next_deadline(now)
+                .is_some_and(|deadline| deadline > now)
+        );
     }
 }

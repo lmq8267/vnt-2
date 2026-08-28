@@ -1,5 +1,5 @@
 use crate::compression::PacketCompression;
-use crate::context::{NetworkRoute, PacketLossStats};
+use crate::context::{NetworkAddr, NetworkRoute, PacketLossStats};
 use crate::crypto::PacketCrypto;
 use crate::enhanced_tunnel::inbound::EnhancedInbound;
 use crate::fec::FecDecoder;
@@ -12,12 +12,39 @@ use rust_p2p_core::route::RouteKey;
 use rust_p2p_core::tunnel::Tunnel;
 use std::net::{IpAddr, Ipv4Addr};
 
+#[derive(Clone, Copy)]
 struct PacketContext {
     msg_type: MsgType,
     src_ip: Ipv4Addr,
     dest_ip: Ipv4Addr,
     max_ttl: u8,
     ttl: u8,
+}
+
+fn valid_punch_source(net: &NetworkAddr, source: Ipv4Addr) -> bool {
+    !source.is_unspecified() && source != net.ip && net.network().contains(&source)
+}
+
+fn valid_relay_probe(net: &NetworkAddr, ctx: &PacketContext) -> bool {
+    valid_punch_source(net, ctx.src_ip) && ctx.dest_ip == net.ip && ctx.max_ttl == 2 && ctx.ttl == 0
+}
+
+fn build_handshake_response(
+    msg_type: MsgType,
+    local_ip: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    encrypt_reserve: usize,
+) -> anyhow::Result<NetPacket<TransmissionBytes>> {
+    let mut packet = NetPacket::new(TransmissionBytes::zeroed_size(
+        HEAD_LENGTH + 8,
+        encrypt_reserve,
+    ))?;
+    packet.set_msg_type(msg_type);
+    packet.set_ttl(1);
+    packet.set_src_id(local_ip.into());
+    packet.set_dest_id(peer_ip.into());
+    packet.set_payload(&crate::utils::time::now_ts_ms().to_be_bytes())?;
+    Ok(packet)
 }
 
 pub(crate) struct P2pInboundConfig {
@@ -180,13 +207,13 @@ impl P2pInboundHandler {
             MsgType::Ping => {
                 let metric = ctx.max_ttl - ctx.ttl;
                 self.route_table
-                    .add_route_if_absent(ctx.src_ip, Route::from_default_rt(route_key, metric));
+                    .add_route(ctx.src_ip, Route::from_default_rt(route_key, metric));
                 let mut packet = NetPacket::new(TransmissionBytes::zeroed_size(
                     HEAD_LENGTH + 8,
                     self.packet_crypto.encrypt_reserve(),
                 ))?;
                 packet.set_msg_type(MsgType::Pong);
-                packet.set_ttl(1);
+                packet.set_ttl(metric);
                 packet.set_src_id(ctx.dest_ip.into());
                 packet.set_dest_id(ctx.src_ip.into());
                 packet.set_payload(net_packet.payload())?;
@@ -218,6 +245,13 @@ impl P2pInboundHandler {
             MsgType::PunchStart1 => {}
             MsgType::PunchStart2 => {}
             MsgType::PunchReq => {
+                if !valid_punch_source(net, ctx.src_ip) {
+                    log::debug!(
+                        "ignore invalid PunchReq from {} via {route_key:?}",
+                        ctx.src_ip
+                    );
+                    return Ok(());
+                }
                 if let IpAddr::V4(ip) = route_key.addr().ip()
                     && self.network_contains(&ip)
                 {
@@ -230,15 +264,12 @@ impl P2pInboundHandler {
                     ctx.dest_ip
                 );
                 self.route_table.add_owner_route(ctx.src_ip, route_key);
-                let mut packet = NetPacket::new(TransmissionBytes::zeroed_size(
-                    HEAD_LENGTH + 8,
+                let mut packet = build_handshake_response(
+                    MsgType::PunchRes,
+                    net.ip,
+                    ctx.src_ip,
                     self.packet_crypto.encrypt_reserve(),
-                ))?;
-                packet.set_msg_type(MsgType::PunchRes);
-                packet.set_ttl(1);
-                packet.set_src_id(ctx.dest_ip.into());
-                packet.set_dest_id(ctx.src_ip.into());
-                packet.set_payload(&crate::utils::time::now_ts_ms().to_be_bytes())?;
+                )?;
 
                 self.packet_crypto.encrypt_in_place(&mut packet)?;
                 tunnel
@@ -246,6 +277,13 @@ impl P2pInboundHandler {
                     .await?;
             }
             MsgType::PunchRes => {
+                if !valid_punch_source(net, ctx.src_ip) {
+                    log::debug!(
+                        "ignore invalid PunchRes from {} via {route_key:?}",
+                        ctx.src_ip
+                    );
+                    return Ok(());
+                }
                 if let IpAddr::V4(ip) = route_key.addr().ip()
                     && self.network_contains(&ip)
                 {
@@ -259,12 +297,62 @@ impl P2pInboundHandler {
                 );
                 self.route_table.add_owner_route(ctx.src_ip, route_key);
             }
+            MsgType::DirectConnectReq => {
+                if !valid_punch_source(net, ctx.src_ip) {
+                    log::debug!(
+                        "ignore invalid DirectConnectReq from {} via {route_key:?}",
+                        ctx.src_ip
+                    );
+                    return Ok(());
+                }
+                log::info!(
+                    "直接连接成功 {}->{},route={route_key:?}",
+                    ctx.src_ip,
+                    net.ip
+                );
+                self.route_table.add_owner_route(ctx.src_ip, route_key);
+                let mut packet = build_handshake_response(
+                    MsgType::DirectConnectRes,
+                    net.ip,
+                    ctx.src_ip,
+                    self.packet_crypto.encrypt_reserve(),
+                )?;
+                self.packet_crypto.encrypt_in_place(&mut packet)?;
+                tunnel
+                    .send_to(packet.into_bytes().into_buffer(), route_key.addr())
+                    .await?;
+            }
+            MsgType::DirectConnectRes => {
+                if !valid_punch_source(net, ctx.src_ip) {
+                    log::debug!(
+                        "ignore invalid DirectConnectRes from {} via {route_key:?}",
+                        ctx.src_ip
+                    );
+                    return Ok(());
+                }
+                log::info!(
+                    "直接连接响应 {}->{},route={route_key:?}",
+                    ctx.src_ip,
+                    ctx.dest_ip
+                );
+                self.route_table.add_owner_route(ctx.src_ip, route_key);
+            }
             MsgType::PingTurn => {}
             MsgType::PongTurn => {}
             MsgType::RelayProbe => {
+                if !valid_relay_probe(net, ctx) {
+                    log::debug!(
+                        "ignore invalid RelayProbe from {} to {} with ttl {}/{}",
+                        ctx.src_ip,
+                        ctx.dest_ip,
+                        ctx.ttl,
+                        ctx.max_ttl
+                    );
+                    return Ok(());
+                }
                 let metric = ctx.max_ttl - ctx.ttl;
                 self.route_table
-                    .add_route_if_absent(ctx.src_ip, Route::from_default_rt(route_key, metric));
+                    .add_relay_route(ctx.src_ip, Route::from_default_rt(route_key, metric));
                 let mut packet = NetPacket::new(TransmissionBytes::zeroed_size(
                     HEAD_LENGTH,
                     self.packet_crypto.encrypt_reserve(),
@@ -280,9 +368,19 @@ impl P2pInboundHandler {
                     .await?;
             }
             MsgType::RelayProbeReply => {
+                if !valid_relay_probe(net, ctx) {
+                    log::debug!(
+                        "ignore invalid RelayProbeReply from {} to {} with ttl {}/{}",
+                        ctx.src_ip,
+                        ctx.dest_ip,
+                        ctx.ttl,
+                        ctx.max_ttl
+                    );
+                    return Ok(());
+                }
                 let metric = ctx.max_ttl - ctx.ttl;
                 self.route_table
-                    .add_route(ctx.src_ip, Route::from_default_rt(route_key, metric));
+                    .add_relay_route(ctx.src_ip, Route::from_default_rt(route_key, metric));
             }
             _ => {}
         }
@@ -292,6 +390,82 @@ impl P2pInboundHandler {
     pub async fn tcp_disconnect(&self, route_key: RouteKey) {
         if let Some(ip) = self.route_table.get_id_by_route_key(&route_key) {
             self.route_table.remove_route(&ip, &route_key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn network() -> NetworkAddr {
+        NetworkAddr {
+            gateway: Ipv4Addr::new(10, 26, 0, 1),
+            broadcast: Ipv4Addr::new(10, 26, 0, 255),
+            ip: Ipv4Addr::new(10, 26, 0, 2),
+            prefix_len: 24,
+        }
+    }
+
+    #[test]
+    fn punch_source_must_be_another_member_of_the_virtual_network() {
+        let net = network();
+        assert!(valid_punch_source(&net, Ipv4Addr::new(10, 26, 0, 3)));
+        assert!(!valid_punch_source(&net, Ipv4Addr::UNSPECIFIED));
+        assert!(!valid_punch_source(&net, net.ip));
+        assert!(!valid_punch_source(&net, Ipv4Addr::new(10, 27, 0, 3)));
+    }
+
+    #[test]
+    fn handshake_responses_identify_the_local_virtual_ip() {
+        let local = Ipv4Addr::new(10, 26, 0, 2);
+        let peer = Ipv4Addr::new(10, 26, 0, 3);
+        for msg_type in [MsgType::PunchRes, MsgType::DirectConnectRes] {
+            let packet = build_handshake_response(msg_type, local, peer, 0).unwrap();
+            assert_eq!(packet.msg_type().unwrap(), msg_type);
+            assert_eq!(Ipv4Addr::from(packet.src_id()), local);
+            assert_eq!(Ipv4Addr::from(packet.dest_id()), peer);
+            assert_eq!(packet.payload().len(), 8);
+        }
+    }
+
+    #[test]
+    fn relay_probe_requires_valid_virtual_endpoints_and_exactly_two_hops() {
+        let net = network();
+        let valid = PacketContext {
+            msg_type: MsgType::RelayProbe,
+            src_ip: Ipv4Addr::new(10, 26, 0, 3),
+            dest_ip: net.ip,
+            max_ttl: 2,
+            ttl: 0,
+        };
+        assert!(valid_relay_probe(&net, &valid));
+
+        for invalid in [
+            PacketContext {
+                src_ip: Ipv4Addr::UNSPECIFIED,
+                ..valid
+            },
+            PacketContext {
+                src_ip: net.ip,
+                ..valid
+            },
+            PacketContext {
+                src_ip: Ipv4Addr::new(10, 27, 0, 3),
+                ..valid
+            },
+            PacketContext {
+                dest_ip: Ipv4Addr::new(10, 26, 0, 4),
+                ..valid
+            },
+            PacketContext {
+                max_ttl: 1,
+                ttl: 0,
+                ..valid
+            },
+            PacketContext { ttl: 1, ..valid },
+        ] {
+            assert!(!valid_relay_probe(&net, &invalid));
         }
     }
 }
