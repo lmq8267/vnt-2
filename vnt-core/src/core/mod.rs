@@ -60,6 +60,11 @@ impl NetworkManager {
         task_group: TaskGroup,
     ) -> anyhow::Result<NetworkManager> {
         let app_state = AppState::default();
+        // 本机 NAT 身份变化（换网/NAT 重启等）时，把所有对端的
+        // 打洞退避截止时刻压缩到 10 分钟内；对称 NAT 的端口抖动
+        // 不算变化（见 nat_identity_changed）
+        let backoff = app_state.punch_backoff.clone();
+        app_state.nat_info.set_on_change(move || backoff.cap_all());
         config.check()?;
         let outbound_interface_name = config
             .outbound_interface
@@ -124,7 +129,7 @@ impl NetworkManager {
         let subnet_external_route = app_state.subnet_route.clone();
         subnet_external_route.set_route_table(config.input.clone());
 
-        let fec_decoder = FecDecoder::new();
+        let fec_decoder = FecDecoder::new(packet_crypto.clone());
         let basic_outbound = BasicOutbound::new(
             tunnel_to_server.clone(),
             p2p_socket.clone(),

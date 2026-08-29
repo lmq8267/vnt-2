@@ -1,7 +1,7 @@
 use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
 use crate::protocol::transmission::TransmissionBytes;
 use crate::tunnel_core::outbound::BasicOutbound;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use parking_lot::Mutex;
 use prost::Message;
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -24,11 +24,13 @@ const REDUNDANCY_RATE: f32 = 0.2;
 const BATCH_TIMEOUT_MS: u64 = 20;
 const MIN_PARITY: usize = 1;
 const BATCH_CHANNEL_SIZE: usize = 1024;
+const PACKET_LENGTH_SIZE: usize = size_of::<u16>();
 
 #[derive(Clone)]
 pub struct FecEncoder {
     batch_states: Arc<Mutex<HashMap<Ipv4Addr, DestBatchState>>>,
     batch_tx: mpsc::Sender<(Ipv4Addr, Ipv4Addr, u64, Vec<TransmissionBytes>)>,
+    fec_auth_reserve: usize,
 }
 
 struct DestBatchState {
@@ -45,6 +47,7 @@ impl FecEncoder {
         let encoder = Self {
             batch_states: batch_states.clone(),
             batch_tx,
+            fec_auth_reserve: basic_outbound.fec_auth_reserve(),
         };
 
         task_group.spawn(fec_encoder_worker(batch_rx, basic_outbound, batch_states));
@@ -55,35 +58,37 @@ impl FecEncoder {
     /// 将数据包加入FEC批次并返回包装后的包
     pub fn encode(
         &self,
-        mut packet: NetPacket<TransmissionBytes>,
+        packet: NetPacket<TransmissionBytes>,
     ) -> Result<NetPacket<TransmissionBytes>> {
         let src_ip = Ipv4Addr::from(packet.src_id());
         let dest = Ipv4Addr::from(packet.dest_id());
-        if packet.payload().len() > u16::MAX as usize {
-            bail!("Payload too big");
-        }
-        let original_payload = packet.payload().to_vec();
-        let original_payload_len = original_payload.len();
-
-        let type_byte = packet.head()[0];
-        let flags_byte = packet.head()[2];
-
-        // 组装FEC数据: [type_byte, flags_byte, payload_len(u16), payload...]
-        let batch_len = 4 + original_payload_len;
+        // FEC 编码完整内层 NetPacket：普通包已完成 AEAD 加密，QUIC 包由 QUIC 加密。
+        // 长度前缀用于去除 RS 等长 shard 的尾部填充。
+        let original_packet = packet.buffer().to_vec();
+        let original_packet_len = u16::try_from(original_packet.len())
+            .map_err(|_| anyhow::anyhow!("Packet too big: {}", original_packet.len()))?;
+        let batch_len = PACKET_LENGTH_SIZE
+            .checked_add(original_packet.len())
+            .ok_or_else(|| anyhow::anyhow!("FEC packet length overflow"))?;
         let mut batch_buffer = TransmissionBytes::zeroed(batch_len);
-        batch_buffer[0] = type_byte;
-        batch_buffer[1] = flags_byte;
-        batch_buffer[2..4].copy_from_slice(&(original_payload_len as u16).to_be_bytes());
-        batch_buffer[4..batch_len].copy_from_slice(&original_payload);
+        batch_buffer[..PACKET_LENGTH_SIZE].copy_from_slice(&original_packet_len.to_be_bytes());
+        batch_buffer[PACKET_LENGTH_SIZE..].copy_from_slice(&original_packet);
 
         let (group_id, packet_index) = {
             let mut states = self.batch_states.lock();
             let state = states.entry(dest).or_insert_with(|| DestBatchState {
                 group_id: 0,
                 current_batch: Vec::with_capacity(BATCH_SIZE),
-                deadline: Instant::now() + Duration::from_millis(BATCH_TIMEOUT_MS),
+                deadline: Instant::now(),
                 src_ip,
             });
+
+            // 批处理窗口从首包到达时开始。上一批结束后的空闲时间不能消耗
+            // 下一批的 20ms 窗口，否则空闲后的首包会在下一个 5ms tick 被立即刷走。
+            if state.current_batch.is_empty() {
+                state.deadline = Instant::now() + Duration::from_millis(BATCH_TIMEOUT_MS);
+                state.src_ip = src_ip;
+            }
 
             let group_id = state.group_id;
             let packet_index = state.current_batch.len();
@@ -92,8 +97,7 @@ impl FecEncoder {
 
             if state.current_batch.len() >= BATCH_SIZE {
                 let batch = std::mem::take(&mut state.current_batch);
-                state.group_id += 1;
-                state.deadline = Instant::now() + Duration::from_millis(BATCH_TIMEOUT_MS);
+                state.group_id = state.group_id.wrapping_add(1);
 
                 if self
                     .batch_tx
@@ -114,18 +118,22 @@ impl FecEncoder {
         let fec_packet = FecPacket {
             group_id,
             packet_index: packet_index as u32,
-            payload: original_payload,
+            payload: original_packet,
             parity_data: None,
         };
 
         let fec_payload = fec_packet.encode_to_vec();
-        packet
-            .source_buf_mut()
-            .resize(HEAD_LENGTH + fec_payload.len(), 0);
-        packet.set_payload(&fec_payload)?;
-        packet.set_fec_flag(true);
+        let buffer =
+            TransmissionBytes::zeroed_size(HEAD_LENGTH + fec_payload.len(), self.fec_auth_reserve);
+        let mut outer_packet = NetPacket::new(buffer)?;
+        outer_packet.set_msg_type(MsgType::Turn);
+        outer_packet.set_src_id(src_ip.into());
+        outer_packet.set_dest_id(dest.into());
+        outer_packet.set_ttl(packet.max_ttl());
+        outer_packet.set_fec_flag(true);
+        outer_packet.set_payload(&fec_payload)?;
 
-        Ok(packet)
+        Ok(outer_packet)
     }
 }
 
@@ -155,8 +163,7 @@ async fn fec_encoder_worker(
                         if !state.current_batch.is_empty() && now >= state.deadline {
                             let items = std::mem::take(&mut state.current_batch);
                             let group_id = state.group_id;
-                            state.group_id += 1;
-                            state.deadline = Instant::now() + Duration::from_millis(BATCH_TIMEOUT_MS);
+                            state.group_id = state.group_id.wrapping_add(1);
                             batches.push((state.src_ip,*dest, group_id, items));
                         }
                     }
@@ -225,7 +232,10 @@ async fn encode_and_send_parity(
 
         let fec_payload = fec_packet.encode_to_vec();
 
-        let buffer = TransmissionBytes::zeroed(HEAD_LENGTH + fec_payload.len());
+        let buffer = TransmissionBytes::zeroed_size(
+            HEAD_LENGTH + fec_payload.len(),
+            basic_outbound.fec_auth_reserve(),
+        );
         let mut net_packet = NetPacket::new(buffer)?;
         net_packet.set_msg_type(MsgType::Turn);
         net_packet.set_src_id(src.into());
@@ -234,7 +244,7 @@ async fn encode_and_send_parity(
         net_packet.set_payload(&fec_payload)?;
         net_packet.set_fec_flag(true);
 
-        if let Err(e) = basic_outbound.send_encrypted_packet(dest, net_packet).await {
+        if let Err(e) = basic_outbound.send_fec_packet(dest, net_packet).await {
             log::warn!(
                 "failed to send parity packet {}: {:?}, dest={}, group_id={}",
                 packet_index,
@@ -246,4 +256,143 @@ async fn encode_and_send_parity(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::PacketCrypto;
+
+    #[test]
+    fn data_fec_payload_and_shard_contain_complete_packet() {
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCH_CHANNEL_SIZE);
+        let encoder = FecEncoder {
+            batch_states: Arc::new(Mutex::new(HashMap::new())),
+            batch_tx,
+            fec_auth_reserve: 0,
+        };
+
+        let buffer = TransmissionBytes::zeroed(HEAD_LENGTH + 5);
+        let mut packet = NetPacket::new(buffer).unwrap();
+        packet.set_msg_type(MsgType::Quic);
+        packet.set_ttl(3);
+        packet.set_seq(0x1234_5678);
+        packet.set_src_id(0x0A00_0001);
+        packet.set_dest_id(0x0A00_0002);
+        packet.set_ethernet_flag(true);
+        packet.head_mut()[3] = 0xA5;
+        packet.set_payload(&[1, 2, 3, 4, 5]).unwrap();
+        let original = packet.buffer().to_vec();
+
+        let encoded = encoder.encode(packet).unwrap();
+        assert_eq!(encoded.msg_type().unwrap(), MsgType::Turn);
+        assert!(encoded.is_fec());
+        assert!(!encoded.is_ethernet());
+        assert!(!encoded.is_compressed());
+        assert_eq!(encoded.head()[3], 0);
+        let fec_packet = FecPacket::decode(encoded.payload()).unwrap();
+        assert_eq!(fec_packet.group_id, 0);
+        assert_eq!(fec_packet.payload, original);
+
+        let states = encoder.batch_states.lock();
+        let state = states.get(&Ipv4Addr::from(0x0A00_0002u32)).unwrap();
+        let shard = state.current_batch.first().unwrap();
+        let packet_len = u16::from_be_bytes(shard[..PACKET_LENGTH_SIZE].try_into().unwrap());
+        assert_eq!(packet_len as usize, original.len());
+        assert_eq!(&shard[PACKET_LENGTH_SIZE..], original.as_slice());
+    }
+
+    #[test]
+    fn rejects_complete_packet_larger_than_u16() {
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCH_CHANNEL_SIZE);
+        let encoder = FecEncoder {
+            batch_states: Arc::new(Mutex::new(HashMap::new())),
+            batch_tx,
+            fec_auth_reserve: 0,
+        };
+        let mut packet = NetPacket::new(TransmissionBytes::zeroed(u16::MAX as usize + 1)).unwrap();
+        packet.set_src_id(0x0A00_0001);
+        packet.set_dest_id(0x0A00_0002);
+
+        let err = match encoder.encode(packet) {
+            Err(err) => err,
+            Ok(_) => panic!("oversized complete packet must be rejected"),
+        };
+        assert!(err.to_string().contains("Packet too big"));
+    }
+
+    #[test]
+    fn encrypted_turn_packet_is_the_fec_inner_payload() {
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCH_CHANNEL_SIZE);
+        let encoder = FecEncoder {
+            batch_states: Arc::new(Mutex::new(HashMap::new())),
+            batch_tx,
+            fec_auth_reserve: 0,
+        };
+        let crypto = PacketCrypto::new_from_str(Some("fec-encrypted-inner")).unwrap();
+        let plaintext = [9, 8, 7, 6, 5];
+        let mut packet = NetPacket::new(TransmissionBytes::zeroed_size(
+            HEAD_LENGTH + plaintext.len(),
+            crypto.encrypt_reserve(),
+        ))
+        .unwrap();
+        packet.set_msg_type(MsgType::Turn);
+        packet.set_ttl(5);
+        packet.set_src_id(0x0A00_0001);
+        packet.set_dest_id(0x0A00_0002);
+        packet.set_payload(&plaintext).unwrap();
+        crypto.encrypt_in_place(&mut packet).unwrap();
+        let encrypted = packet.buffer().to_vec();
+
+        let encoded = encoder.encode(packet).unwrap();
+        let fec_packet = FecPacket::decode(encoded.payload()).unwrap();
+        assert_eq!(fec_packet.payload, encrypted);
+
+        let mut recovered =
+            NetPacket::new(TransmissionBytes::from(fec_packet.payload.as_slice())).unwrap();
+        crypto.decrypt_in_place(&mut recovered).unwrap();
+        assert_eq!(recovered.payload(), plaintext);
+    }
+
+    #[test]
+    fn first_packet_after_idle_restarts_full_batch_window() {
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCH_CHANNEL_SIZE);
+        let batch_states = Arc::new(Mutex::new(HashMap::new()));
+        let encoder = FecEncoder {
+            batch_states: batch_states.clone(),
+            batch_tx,
+            fec_auth_reserve: 0,
+        };
+        let src = Ipv4Addr::new(10, 0, 0, 1);
+        let dest = Ipv4Addr::new(10, 0, 0, 2);
+        batch_states.lock().insert(
+            dest,
+            DestBatchState {
+                group_id: 7,
+                current_batch: Vec::new(),
+                deadline: Instant::now() - Duration::from_secs(1),
+                src_ip: Ipv4Addr::UNSPECIFIED,
+            },
+        );
+
+        let mut packet = NetPacket::new(TransmissionBytes::zeroed(HEAD_LENGTH + 1)).unwrap();
+        packet.set_msg_type(MsgType::Turn);
+        packet.set_src_id(src.into());
+        packet.set_dest_id(dest.into());
+        packet.set_payload(&[1]).unwrap();
+        let before_encode = Instant::now();
+
+        let encoded = encoder.encode(packet).unwrap();
+        let fec_packet = FecPacket::decode(encoded.payload()).unwrap();
+        assert_eq!(fec_packet.group_id, 7);
+        assert_eq!(fec_packet.packet_index, 0);
+
+        let states = batch_states.lock();
+        let state = states.get(&dest).unwrap();
+        assert!(
+            state.deadline >= before_encode + Duration::from_millis(BATCH_TIMEOUT_MS),
+            "first packet after idle did not receive a full batch window"
+        );
+        assert_eq!(state.src_ip, src);
+    }
 }

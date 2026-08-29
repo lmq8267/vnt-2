@@ -72,7 +72,10 @@ impl ServerTurnInboundHandler {
         })
     }
     fn update_peer_nat_info(&self, ip: Ipv4Addr, nat_info: NatInfo) {
-        self.peer_map.update_nat_info(ip, nat_info);
+        if self.peer_map.update_nat_info(ip, nat_info) {
+            // 对端 NAT 变化时，把该对端的退避截止时刻压缩到 10 分钟内
+            self.punch_backoff.cap(ip);
+        }
     }
 
     pub async fn handle_server_data(
@@ -152,57 +155,65 @@ impl ServerTurnInboundHandler {
         transport_client: &mut TransportClient,
         data: TransmissionBytes,
     ) -> anyhow::Result<()> {
-        let mut net_packet = NetPacket::new(data)?;
+        let net_packet = NetPacket::new(data)?;
+        let _ = net_packet.msg_type()?;
+
+        // FEC 外层只做认证，解码后再按每个内层包的类型决定是否 AEAD 解密。
+        if net_packet.is_fec() {
+            let packets = self.fec_decoder.receive(net_packet)?;
+            if let Some(packets) = packets {
+                for pkt in packets {
+                    self.process_inner_packet(network_addr, transport_client, pkt)
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+
+        self.process_inner_packet(network_addr, transport_client, net_packet)
+            .await
+    }
+
+    async fn process_inner_packet(
+        &self,
+        network_addr: NetworkAddr,
+        transport_client: &mut TransportClient,
+        mut net_packet: NetPacket<TransmissionBytes>,
+    ) -> anyhow::Result<()> {
+        let msg_type = net_packet.msg_type()?;
+        if msg_type != MsgType::Quic
+            && let Err(e) = self.packet_crypto.decrypt_in_place(&mut net_packet)
+        {
+            log::error!(
+                "{},msg_type={msg_type:?},src={},dst={}",
+                e,
+                Ipv4Addr::from(net_packet.src_id()),
+                Ipv4Addr::from(net_packet.dest_id())
+            );
+            return Ok(());
+        }
+        self.process_plain_packet(network_addr, transport_client, net_packet)
+            .await
+    }
+
+    /// 处理已经完成普通包解密/FEC 解码的原始 NetPacket。
+    async fn process_plain_packet(
+        &self,
+        network_addr: NetworkAddr,
+        transport_client: &mut TransportClient,
+        net_packet: NetPacket<TransmissionBytes>,
+    ) -> anyhow::Result<()> {
         let msg_type = net_packet.msg_type()?;
         let src = Ipv4Addr::from(net_packet.src_id());
         let dest = Ipv4Addr::from(net_packet.dest_id());
 
         if msg_type == MsgType::Quic {
-            // QUIC 数据不加密不压缩，但可能有 FEC
-            if net_packet.is_fec() {
-                let packets = self.fec_decoder.receive(net_packet)?;
-                if let Some(packets) = packets {
-                    for pkt in packets {
-                        self.enhanced_inbound
-                            .inbound(&network_addr, msg_type, src, pkt)
-                            .await?;
-                    }
-                }
-                return Ok(());
-            }
-            self.enhanced_inbound
+            return self
+                .enhanced_inbound
                 .inbound(&network_addr, msg_type, src, net_packet)
-                .await?;
-            return Ok(());
+                .await;
         }
 
-        // 解密
-        if let Err(e) = self.packet_crypto.decrypt_in_place(&mut net_packet) {
-            log::error!("{},mst_type={msg_type:?},src={src},dst={dest}", e);
-            return Ok(());
-        }
-
-        // FEC 解码（始终尝试解码，如果有 FEC 标志）
-        if net_packet.is_fec() {
-            let packets = self.fec_decoder.receive(net_packet)?;
-            if let Some(packets) = packets {
-                for pkt in packets {
-                    let pkt = self.packet_compression.decompress(pkt)?;
-                    self.process_decompressed_packet(
-                        network_addr,
-                        transport_client,
-                        pkt,
-                        msg_type,
-                        src,
-                        dest,
-                    )
-                    .await?;
-                }
-            }
-            return Ok(());
-        }
-
-        // 解压缩
         let net_packet = self.packet_compression.decompress(net_packet)?;
         self.process_decompressed_packet(
             network_addr,
