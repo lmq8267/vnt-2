@@ -1,16 +1,18 @@
 use crate::compression::PacketCompression;
+use crate::context::config::{TurnRule, allow_punch};
 use crate::context::{NetworkAddr, NetworkRoute, PacketLossStats};
 use crate::crypto::PacketCrypto;
 use crate::enhanced_tunnel::inbound::EnhancedInbound;
 use crate::fec::FecDecoder;
 use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
 use crate::protocol::transmission::TransmissionBytes;
-use crate::tunnel_core::p2p::outbound::P2pOutbound;
+use crate::tunnel_core::outbound::BasicOutbound;
 use crate::tunnel_core::p2p::route_table::{Route, RouteTable};
 use anyhow::bail;
 use rust_p2p_core::route::RouteKey;
 use rust_p2p_core::tunnel::Tunnel;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct PacketContext {
@@ -55,6 +57,8 @@ pub(crate) struct P2pInboundConfig {
     pub packet_compression: PacketCompression,
     pub enhanced_inbound: EnhancedInbound,
     pub fec_decoder: FecDecoder,
+    pub turn: Arc<Vec<TurnRule>>,
+    pub basic_outbound: BasicOutbound,
 }
 
 #[derive(Clone)]
@@ -66,6 +70,8 @@ pub(crate) struct P2pInboundHandler {
     packet_compression: PacketCompression,
     enhanced_inbound: EnhancedInbound,
     fec_decoder: FecDecoder,
+    turn: Arc<Vec<TurnRule>>,
+    basic_outbound: BasicOutbound,
 }
 
 impl P2pInboundHandler {
@@ -78,6 +84,8 @@ impl P2pInboundHandler {
             packet_compression: config.packet_compression,
             enhanced_inbound: config.enhanced_inbound,
             fec_decoder: config.fec_decoder,
+            turn: config.turn,
+            basic_outbound: config.basic_outbound,
         }
     }
     fn network_contains(&self, ip: &Ipv4Addr) -> bool {
@@ -87,13 +95,9 @@ impl P2pInboundHandler {
         &self,
         buf: TransmissionBytes,
         route_key: RouteKey,
-        p2p_socket_manager: &P2pOutbound,
         tunnel: &mut Tunnel,
     ) {
-        if let Err(e) = self
-            .next_handle_impl(buf, route_key, p2p_socket_manager, tunnel)
-            .await
-        {
+        if let Err(e) = self.next_handle_impl(buf, route_key, tunnel).await {
             log::warn!(
                 "Error while handling P2pInboundHandler: {:?},route={route_key:?}",
                 e
@@ -104,7 +108,6 @@ impl P2pInboundHandler {
         &self,
         buf: TransmissionBytes,
         route_key: RouteKey,
-        p2p_socket_manager: &P2pOutbound,
         tunnel: &mut Tunnel,
     ) -> anyhow::Result<()> {
         let mut net_packet = NetPacket::new(buf)?;
@@ -131,13 +134,9 @@ impl P2pInboundHandler {
         {
             // 帮忙转发数据包
             if ttl >= 1 {
-                if let Some(route) = p2p_socket_manager.get_route_by_id(&dest_ip) {
-                    p2p_socket_manager
-                        .send_raw_to(net_packet.into_bytes(), &route.route_key())
-                        .await?;
-                } else {
-                    log::debug!("未找到到 {} 的路由，无法转发", dest_ip);
-                }
+                self.basic_outbound
+                    .send_raw(net, dest_ip, net_packet)
+                    .await?;
             }
             return Ok(());
         }
@@ -260,6 +259,10 @@ impl P2pInboundHandler {
             MsgType::PunchStart1 => {}
             MsgType::PunchStart2 => {}
             MsgType::PunchReq => {
+                if !allow_punch(&self.turn, &ctx.src_ip) {
+                    log::debug!("ignore configured turn target PunchReq from {}", ctx.src_ip);
+                    return Ok(());
+                }
                 if !valid_punch_source(net, ctx.src_ip) {
                     log::debug!(
                         "ignore invalid PunchReq from {} via {route_key:?}",
@@ -292,6 +295,10 @@ impl P2pInboundHandler {
                     .await?;
             }
             MsgType::PunchRes => {
+                if !allow_punch(&self.turn, &ctx.src_ip) {
+                    log::debug!("ignore configured turn target PunchRes from {}", ctx.src_ip);
+                    return Ok(());
+                }
                 if !valid_punch_source(net, ctx.src_ip) {
                     log::debug!(
                         "ignore invalid PunchRes from {} via {route_key:?}",

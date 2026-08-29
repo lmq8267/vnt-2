@@ -5,12 +5,14 @@ export const emptyFormData = () => ({
   network_code: "",
   server: [""],
   peer_address: [],
+  turn: [],
   ip: "",
   mtu: null,
   rtx: false,
   fec: false,
   compress: false,
   no_punch: false,
+  no_broadcast: false,
   input: [],
   output: [],
   no_nat: false,
@@ -56,6 +58,12 @@ export const parseTomlToForm = (toml) => {
         const items = match[1].match(/"([^"]*)"/g);
         if (items) data.peer_address = items.map((s) => s.replace(/"/g, ""));
       }
+    } else if (trimmed.match(/^turn\s*=/)) {
+      const match = trimmed.match(/turn\s*=\s*\[(.*)\]/);
+      if (match) {
+        const items = match[1].match(/"([^"]*)"/g);
+        if (items) data.turn = items.map((s) => s.replace(/"/g, ""));
+      }
     } else if (trimmed.includes("ip =")) {
       const match = trimmed.match(/ip\s*=\s*"([^"]*)"/);
       if (match) data.ip = match[1];
@@ -70,6 +78,8 @@ export const parseTomlToForm = (toml) => {
       data.compress = trimmed.includes("true");
     } else if (trimmed.match(/^no_punch\s*=/)) {
       data.no_punch = trimmed.includes("true");
+    } else if (trimmed.match(/^no_broadcast\s*=/)) {
+      data.no_broadcast = trimmed.includes("true");
     } else if (trimmed.startsWith("input")) {
       const match = trimmed.match(/input\s*=\s*\[(.*)\]/);
       if (match) {
@@ -170,6 +180,13 @@ export const formToToml = (formData) => {
     toml += `peer_address = [${peerAddresses.map((s) => `"${s}"`).join(", ")}]\n`;
   }
 
+  const turnRules = formData.turn.filter((s) => s.trim());
+  if (turnRules.length > 0) {
+    toml += "\n# 指定目标虚拟 IP 或网段的优先中转虚拟 IP；填写网关 IP 时强制走服务器中继\n";
+    toml += "# 命中目标不参与 P2P 打洞\n";
+    toml += `turn = [${turnRules.map((s) => `"${s}"`).join(", ")}]\n`;
+  }
+
   if (formData.ip) {
     toml += "\n# 自定义虚拟 IP (可选)\n";
     toml += `ip = "${formData.ip}"\n`;
@@ -190,6 +207,11 @@ export const formToToml = (formData) => {
   if (formData.no_punch) {
     toml += "\n# 是否关闭 P2P 打洞 (默认 false)\n";
     toml += "no_punch = true\n";
+  }
+
+  if (formData.no_broadcast) {
+    toml += "\n# 是否关闭 IPv4 广播和组播转发 (默认 false，即开启)\n";
+    toml += "no_broadcast = true\n";
   }
 
   if (formData.compress) {
@@ -303,6 +325,10 @@ server = ["quic://1.2.3.4:29872"]
 # 可直连节点地址列表 (可选)
 # peer_address = ["1.2.3.4:29873", "tcp://192.168.1.10:29873"]
 
+# 指定目标虚拟 IP 或网段的优先中转虚拟 IP；填写网关 IP 时强制走服务器中继
+# 命中目标不参与 P2P 打洞
+# turn = ["10.26.0.0/24,10.26.0.2", "10.26.1.9,10.26.0.3"]
+
 # ===简单使用以下参数可以不动===
 
 # 自定义虚拟 IP (可选)
@@ -318,6 +344,9 @@ server = ["quic://1.2.3.4:29872"]
 
 # 是否关闭 P2P 打洞 (默认 false,设置为true时关闭)
 # no_punch = false
+
+# 是否关闭 IPv4 广播和组播转发 (默认 false，即开启)
+# no_broadcast = false
 
 # 是否启用 LZ4 压缩 (默认 false,设置为true时开启)
 # compress = false

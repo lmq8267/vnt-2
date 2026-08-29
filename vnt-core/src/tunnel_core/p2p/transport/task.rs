@@ -1,4 +1,4 @@
-use crate::context::config::PeerAddress;
+use crate::context::config::{PeerAddress, TurnRule, turn_ip_for};
 use crate::context::nat::MyNatInfo;
 use crate::context::{AppState, PacketLossStats, SharedNetworkAddr};
 use crate::crypto::PacketCrypto;
@@ -26,6 +26,7 @@ pub(crate) struct P2pInitConfig {
     pub tunnel_port: Option<u16>,
     pub automatic_punch: bool,
     pub peer_address: Vec<PeerAddress>,
+    pub turn: Arc<Vec<TurnRule>>,
     pub default_interface: Option<LocalInterface>,
     pub outbound_interface_name: Option<String>,
 }
@@ -93,6 +94,7 @@ pub async fn init_tunnel(
             server_info: app_state.server_info_collection.clone(),
             punch_backoff: app_state.punch_backoff.clone(),
             punch_info_getter: Arc::new(move || app_state_for_punch.get_punch_info()),
+            turn: config.turn.clone(),
         };
         task_group.spawn(punch_task(tunnel_to_server, route_table.clone(), punch_ctx));
     }
@@ -106,6 +108,7 @@ pub async fn init_tunnel(
         app_state.network.clone(),
         route_table.clone(),
         socket_manager.clone(),
+        config.turn.clone(),
     ));
     let endpoints: HashSet<_> = config
         .peer_address
@@ -124,7 +127,6 @@ pub async fn init_tunnel(
     let p2p_task = P2pTask {
         task_group,
         nat_info: app_state.nat_info.clone(),
-        socket_manager: socket_manager.clone(),
         tunnel_dispatcher,
     };
     Ok((puncher, socket_manager, p2p_task))
@@ -178,7 +180,6 @@ fn build_direct_peer_probe(
 pub struct P2pTask {
     task_group: TaskGroup,
     nat_info: MyNatInfo,
-    socket_manager: P2pOutbound,
     tunnel_dispatcher: TunnelDispatcher,
 }
 impl P2pTask {
@@ -188,7 +189,6 @@ impl P2pTask {
             self.task_group.clone(),
             self.tunnel_dispatcher,
             p2p_inbound_handler,
-            self.socket_manager,
         ));
     }
 }
@@ -323,6 +323,7 @@ impl RelayProbeScheduler {
         now: Instant,
         src: Ipv4Addr,
         routes: &[(Ipv4Addr, Vec<crate::tunnel_core::p2p::route_table::Route>)],
+        turn: &[TurnRule],
     ) -> Vec<RelayProbeAction> {
         self.refill(now);
 
@@ -349,6 +350,9 @@ impl RelayProbeScheduler {
         let mut eligible = HashMap::new();
         for (ip, list) in routes {
             if *ip == src {
+                continue;
+            }
+            if turn_ip_for(turn, ip).is_some() {
                 continue;
             }
             if list.iter().any(|route| route.is_direct()) {
@@ -500,6 +504,7 @@ pub async fn relay_probe_task(
     network: SharedNetworkAddr,
     route_table: RouteTable,
     socket_manager: P2pOutbound,
+    turn: Arc<Vec<TurnRule>>,
 ) {
     let first_direct_route = route_table.first_direct_route_notify();
     tokio::time::sleep(RELAY_START_DELAY).await;
@@ -513,7 +518,7 @@ pub async fn relay_probe_task(
         let now = Instant::now();
         if let Some(src) = network.ip() {
             let routes = route_table.route_table();
-            let actions = scheduler.plan(now, src, &routes);
+            let actions = scheduler.plan(now, src, &routes, &turn);
             for action in actions {
                 let probe = match build_relay_probe(
                     src,
@@ -558,7 +563,6 @@ pub async fn tunnel_dispatch_task(
     task_group: TaskGroup,
     mut tunnel_factory: TunnelDispatcher,
     p2p_inbound_handler: P2pInboundHandler,
-    p2p_socket_manager: P2pOutbound,
 ) {
     loop {
         let mut tunnel = match tunnel_factory.dispatch().await {
@@ -571,7 +575,6 @@ pub async fn tunnel_dispatch_task(
         log::info!("tunnel {:?}-{:?}", tunnel.protocol(), tunnel.remote_addr());
         let p2p_inbound_handler = p2p_inbound_handler.clone();
         let nat_info = nat_info.clone();
-        let p2p_socket_manager = p2p_socket_manager.clone();
         task_group.spawn(async move {
             let mut buf = vec![0; 65536];
             while let Some(rs) = tunnel.recv_from(&mut buf).await {
@@ -595,7 +598,7 @@ pub async fn tunnel_dispatch_task(
                 let mut bytes = TransmissionBytes::zeroed(len);
                 bytes.copy_from_slice(&buf[..len]);
                 p2p_inbound_handler
-                    .next_handle(bytes, route_key, &p2p_socket_manager, &mut tunnel)
+                    .next_handle(bytes, route_key, &mut tunnel)
                     .await;
             }
             log::info!(
@@ -685,7 +688,7 @@ mod tests {
         let mut probed = HashSet::new();
 
         for _ in 0..3 {
-            for action in scheduler.plan(now, source, &routes) {
+            for action in scheduler.plan(now, source, &routes, &[]) {
                 probed.insert(action.target_ip);
             }
         }
@@ -715,9 +718,31 @@ mod tests {
         ];
         let mut scheduler = RelayProbeScheduler::new(now);
 
-        let actions = scheduler.plan(now, source, &routes);
+        let actions = scheduler.plan(now, source, &routes, &[]);
 
         assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].relay_ip, relay);
+    }
+
+    #[test]
+    fn relay_scheduler_skips_configured_targets_but_keeps_turn_candidate() {
+        let now = Instant::now();
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        let relay = Ipv4Addr::new(10, 0, 0, 2);
+        let configured_target = Ipv4Addr::new(10, 0, 0, 8);
+        let normal_target = Ipv4Addr::new(10, 0, 0, 9);
+        let routes = vec![
+            direct_peer(relay),
+            relay_target(configured_target, 1),
+            relay_target(normal_target, 1),
+        ];
+        let turn = vec!["10.0.0.8,10.0.0.2".parse().unwrap()];
+        let mut scheduler = RelayProbeScheduler::new(now);
+
+        let actions = scheduler.plan(now, source, &routes, &turn);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target_ip, normal_target);
         assert_eq!(actions[0].relay_ip, relay);
     }
 
@@ -733,10 +758,14 @@ mod tests {
         ];
         let mut scheduler = RelayProbeScheduler::new(now);
 
-        assert!(scheduler.plan(now, source, &complete_routes).is_empty());
+        assert!(
+            scheduler
+                .plan(now, source, &complete_routes, &[])
+                .is_empty()
+        );
 
         let reduced_routes = vec![direct_peer(relay), relay_target(target, 2)];
-        let actions = scheduler.plan(now, source, &reduced_routes);
+        let actions = scheduler.plan(now, source, &reduced_routes, &[]);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].target_ip, target);
     }
@@ -752,8 +781,8 @@ mod tests {
         routes.push(relay_target(target, 1));
         let mut scheduler = RelayProbeScheduler::new(now);
 
-        let first = scheduler.plan(now, source, &routes);
-        let second = scheduler.plan(now + RELAY_RESPONSE_WAIT, source, &routes);
+        let first = scheduler.plan(now, source, &routes, &[]);
+        let second = scheduler.plan(now + RELAY_RESPONSE_WAIT, source, &routes, &[]);
         let attempted: HashSet<_> = first
             .iter()
             .chain(second.iter())
@@ -765,7 +794,7 @@ mod tests {
 
         assert!(
             scheduler
-                .plan(now + RELAY_RESPONSE_WAIT * 2, source, &routes)
+                .plan(now + RELAY_RESPONSE_WAIT * 2, source, &routes, &[])
                 .is_empty()
         );
         assert_eq!(
@@ -784,11 +813,11 @@ mod tests {
         routes.extend((100..120).map(|last| relay_target(Ipv4Addr::new(10, 0, 0, last), 1)));
         let mut scheduler = RelayProbeScheduler::new(now);
 
-        let first = scheduler.plan(now, source, &routes);
-        let second = scheduler.plan(now, source, &routes);
+        let first = scheduler.plan(now, source, &routes, &[]);
+        let second = scheduler.plan(now, source, &routes, &[]);
         assert_eq!(first.len(), 20);
         assert_eq!(second.len(), 10);
-        assert!(scheduler.plan(now, source, &routes).is_empty());
+        assert!(scheduler.plan(now, source, &routes, &[]).is_empty());
         assert!(
             scheduler
                 .next_deadline(now)

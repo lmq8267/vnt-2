@@ -14,6 +14,7 @@ public class VntConfig {
 
     private final List<String> servers;
     private final List<String> peerAddresses;
+    private final List<String> turnRules;
     private final String networkCode;
     private final String password;
     private final String deviceId;
@@ -23,6 +24,7 @@ public class VntConfig {
     private final String ip;
     private final String certMode;
     private final boolean noPunch;
+    private final boolean noBroadcast;
     private final boolean compress;
     private final boolean rtx;
     private final boolean fec;
@@ -37,6 +39,7 @@ public class VntConfig {
     private VntConfig(Builder builder) {
         this.servers = builder.servers;
         this.peerAddresses = builder.peerAddresses;
+        this.turnRules = builder.turnRules;
         this.networkCode = builder.networkCode;
         this.password = builder.password;
         this.deviceId = builder.deviceId;
@@ -46,6 +49,7 @@ public class VntConfig {
         this.ip = builder.ip;
         this.certMode = builder.certMode;
         this.noPunch = builder.noPunch;
+        this.noBroadcast = builder.noBroadcast;
         this.compress = builder.compress;
         this.rtx = builder.rtx;
         this.fec = builder.fec;
@@ -80,6 +84,14 @@ public class VntConfig {
             json.put("peer_address", peerArray);
         }
 
+        if (!turnRules.isEmpty()) {
+            JSONArray turnArray = new JSONArray();
+            for (String turnRule : turnRules) {
+                turnArray.put(turnRule);
+            }
+            json.put("turn", turnArray);
+        }
+
         // 可选项
         if (password != null) json.put("password", password);
         if (deviceId != null) json.put("device_id", deviceId);
@@ -92,6 +104,7 @@ public class VntConfig {
 
         // 布尔值
         json.put("no_punch", noPunch);
+        json.put("no_broadcast", noBroadcast);
         json.put("compress", compress);
         json.put("rtx", rtx);
         json.put("fec", fec);
@@ -133,6 +146,7 @@ public class VntConfig {
     public static class Builder {
         private List<String> servers = new ArrayList<>();
         private List<String> peerAddresses = new ArrayList<>();
+        private List<String> turnRules = new ArrayList<>();
         private String networkCode;
         private String password;
         private String deviceId;
@@ -142,6 +156,7 @@ public class VntConfig {
         private String ip;
         private String certMode;
         private boolean noPunch = false;
+        private boolean noBroadcast = false;
         private boolean compress = false;
         private boolean rtx = false;
         private boolean fec = false;
@@ -168,6 +183,15 @@ public class VntConfig {
          */
         public Builder addPeerAddress(String peerAddress) {
             this.peerAddresses.add(peerAddress);
+            return this;
+        }
+
+        /**
+         * 添加指定中转规则（可选）。
+         * @param turnRule 格式：目标虚拟IP或CIDR,中转虚拟IP
+         */
+        public Builder addTurnRule(String turnRule) {
+            this.turnRules.add(turnRule);
             return this;
         }
 
@@ -242,6 +266,14 @@ public class VntConfig {
          */
         public Builder setNoPunch(boolean noPunch) {
             this.noPunch = noPunch;
+            return this;
+        }
+
+        /**
+         * 禁用 IPv4 广播和组播转发（默认false，即开启）
+         */
+        public Builder setNoBroadcast(boolean noBroadcast) {
+            this.noBroadcast = noBroadcast;
             return this;
         }
 
