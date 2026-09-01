@@ -1,4 +1,4 @@
-use crate::context::config::{PeerAddress, TurnRule, turn_ip_for};
+use crate::context::config::{PeerAddress, PeerProtocol, TurnRule, turn_ip_for};
 use crate::context::nat::MyNatInfo;
 use crate::context::{AppState, PacketLossStats, SharedNetworkAddr};
 use crate::crypto::PacketCrypto;
@@ -18,7 +18,7 @@ use rustp2p_core::punch::Puncher;
 use rustp2p_core::route_table::Protocol;
 use rustp2p_core::socket::LocalInterface;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,19 +99,24 @@ pub async fn init_tunnel(
         socket_manager.clone(),
         config.turn.clone(),
     ));
-    let endpoints: HashSet<_> = config
-        .peer_address
-        .iter()
-        .flat_map(PeerAddress::endpoints)
-        .collect();
-    for (protocol, address) in endpoints {
-        task_group.spawn(direct_peer_probe_task(
-            app_state.network.clone(),
-            route_table.clone(),
-            socket_manager.clone(),
-            protocol,
-            address,
-        ));
+    // peer_address 支持域名；域名不在启动时解析，由 direct_peer_probe_task
+    // 在每次使用时解析出地址（支持 DNS 变更），解析失败只告警跳过
+    for peer in &config.peer_address {
+        let protocols: &[Protocol] = match peer.protocol() {
+            PeerProtocol::Both => &[Protocol::TCP, Protocol::UDP],
+            PeerProtocol::Tcp => &[Protocol::TCP],
+            PeerProtocol::Udp => &[Protocol::UDP],
+        };
+        for &protocol in protocols {
+            task_group.spawn(direct_peer_probe_task(
+                app_state.network.clone(),
+                route_table.clone(),
+                socket_manager.clone(),
+                protocol,
+                peer.clone(),
+                config.default_interface.clone(),
+            ));
+        }
     }
     let p2p_task = P2pTask {
         task_group,
@@ -127,13 +132,29 @@ async fn direct_peer_probe_task(
     route_table: RouteTable,
     socket_manager: P2pOutbound,
     protocol: Protocol,
-    address: SocketAddr,
+    peer: PeerAddress,
+    default_interface: Option<LocalInterface>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         let Some(src_ip) = network.ip() else {
+            continue;
+        };
+        // peer 可能为域名，每次使用时解析出当前地址（支持 DNS 变化）
+        let resolved = match peer.endpoints(&default_interface).await {
+            Ok(list) => list,
+            Err(error) => {
+                log::warn!("failed to resolve peer {peer} for {protocol}: {error}");
+                continue;
+            }
+        };
+        let Some(address) = resolved
+            .into_iter()
+            .find(|(p, _)| *p == protocol)
+            .map(|(_, addr)| addr)
+        else {
             continue;
         };
         if route_table.has_direct_endpoint(protocol, address) {
@@ -253,6 +274,8 @@ pub async fn route_timeout_task(route_table: RouteTable, packet_loss_stats: Pack
     }
 }
 
+/// 隧道读空闲超时:超过该时长未收到对端数据则回收隧道
+const TUNNEL_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_ROUTE_TARGET: usize = 3;
 const RELAY_TARGETS_PER_BATCH: usize = 10;
 const RELAY_PROBES_PER_TARGET: usize = 3;
@@ -568,7 +591,16 @@ pub async fn tunnel_dispatch_task(
         let nat_info = nat_info.clone();
         let outbound = outbound.clone();
         task_group.spawn(async move {
-            while let Some(buf) = reader.recv().await {
+            loop {
+                // 超过空闲超时仍未收到数据时回收隧道，避免任务与连接长期驻留
+                let buf = match tokio::time::timeout(TUNNEL_READ_TIMEOUT, reader.recv()).await {
+                    Ok(Some(buf)) => buf,
+                    Ok(None) => break,
+                    Err(_) => {
+                        log::debug!("tunnel {protocol:?}-{remote_addr:?} read idle timeout");
+                        break;
+                    }
+                };
                 if protocol.is_udp()
                     && rustp2p_core::stun::is_stun_response(&buf)
                     && let Some(pub_addr) = rustp2p_core::stun::recv_stun_response(&buf)
@@ -576,10 +608,8 @@ pub async fn tunnel_dispatch_task(
                     nat_info.update_public_addr(pub_addr);
                     continue;
                 }
-                let mut bytes = TransmissionBytes::zeroed(buf.len());
-                bytes.copy_from_slice(&buf);
                 p2p_inbound_handler
-                    .next_handle(bytes, route_key, &writer)
+                    .next_handle(buf.into(), route_key, &writer)
                     .await;
             }
             outbound.remove_tunnel(&route_key);
