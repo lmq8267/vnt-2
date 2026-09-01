@@ -5,7 +5,7 @@ use crate::tls::verifier::CertValidationMode;
 use crate::tunnel_core::server::transport::config::{ConnectRegConfig, ProtocolAddress};
 use anyhow::bail;
 use ipnet::Ipv4Net;
-use rust_p2p_core::route::ConnectProtocol;
+use rustp2p_core::route_table::Protocol;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -113,14 +113,13 @@ impl PeerAddress {
         self.address
     }
 
-    pub(crate) fn endpoints(&self) -> Vec<(ConnectProtocol, SocketAddr)> {
+    pub(crate) fn endpoints(&self) -> Vec<(Protocol, SocketAddr)> {
         match self.protocol {
-            PeerProtocol::Both => vec![
-                (ConnectProtocol::TCP, self.address),
-                (ConnectProtocol::UDP, self.address),
-            ],
-            PeerProtocol::Tcp => vec![(ConnectProtocol::TCP, self.address)],
-            PeerProtocol::Udp => vec![(ConnectProtocol::UDP, self.address)],
+            PeerProtocol::Both => {
+                vec![(Protocol::TCP, self.address), (Protocol::UDP, self.address)]
+            }
+            PeerProtocol::Tcp => vec![(Protocol::TCP, self.address)],
+            PeerProtocol::Udp => vec![(Protocol::UDP, self.address)],
         }
     }
 }
@@ -227,6 +226,8 @@ pub struct Config {
     pub udp_stun: Vec<String>,
     pub tcp_stun: Vec<String>,
     pub tunnel_port: Option<u16>,
+    /// 事件脚本路径/命令；网卡创建成功、掉线、重连成功、IP 变化时以参数方式调用
+    pub event_script: Option<String>,
 }
 impl Config {
     pub fn normalize(&mut self) -> anyhow::Result<()> {
@@ -308,7 +309,7 @@ impl Config {
     pub(crate) fn to_connect_config(
         &self,
         index: usize,
-        default_interface: Option<rust_p2p_core::socket::LocalInterface>,
+        default_interface: Option<rustp2p_core::socket::LocalInterface>,
         registration_ip: crate::tunnel_core::server::transport::config::SharedRegistrationIp,
     ) -> ConnectRegConfig {
         ConnectRegConfig {
