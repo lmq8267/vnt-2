@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 use vnt_core::api::VntApi;
 use vnt_core::context::config::{Config, DeviceMode, PeerAddress, TurnRule};
 use vnt_core::core::{NetworkManager, RegisterResponse};
-use vnt_core::nat::NetInput;
+use vnt_core::nat::{NetInput, SubnetMapping};
 use vnt_core::port_mapping::PortMapping;
 use vnt_core::tls::verifier::CertValidationMode;
 use vnt_core::tunnel_core::server::transport::config::ProtocolAddress;
@@ -80,6 +80,11 @@ fn encryption_state(local_key: Option<&str>, peer_key: Option<&str>) -> i32 {
         (None, Some(_)) => 4,
         (Some(_), Some(_)) => 5,
     }
+}
+
+#[allow(dead_code)]
+fn subnet_routes_json(routes: Vec<NetInput>) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&routes)?)
 }
 
 /// JNI 导出函数的 panic 防护：panic 时向 JVM 抛出异常并返回默认值
@@ -166,8 +171,9 @@ pub extern "system" fn Java_com_vnt_VntManager_nativeCreateNetwork<'local>(
             if !ip_update_listener.is_null() {
                 let java_vm = Arc::new(env.get_java_vm()?);
                 let listener = env.new_global_ref(&ip_update_listener)?;
+                let ip_java_vm = java_vm.clone();
                 network_manager.set_android_ip_update_callback(Arc::new(move |request| {
-                    let mut env = java_vm.attach_current_thread()?;
+                    let mut env = ip_java_vm.attach_current_thread()?;
                     let ip = env.new_string(request.ip.to_string())?;
                     let call_result = env.call_method(
                         listener.as_obj(),
@@ -183,6 +189,25 @@ pub extern "system" fn Java_com_vnt_VntManager_nativeCreateNetwork<'local>(
                         env.exception_describe()?;
                         env.exception_clear()?;
                         anyhow::bail!("Android IP 更新监听器抛出异常");
+                    }
+                    call_result?;
+                    Ok(())
+                }));
+
+                let listener = env.new_global_ref(&ip_update_listener)?;
+                network_manager.set_android_subnet_route_callback(Arc::new(move |routes| {
+                    let mut env = java_vm.attach_current_thread()?;
+                    let routes = env.new_string(subnet_routes_json(routes)?)?;
+                    let call_result = env.call_method(
+                        listener.as_obj(),
+                        "onSubnetRoutesChanged",
+                        "(Ljava/lang/String;)V",
+                        &[JValue::Object(&routes)],
+                    );
+                    if env.exception_check()? {
+                        env.exception_describe()?;
+                        env.exception_clear()?;
+                        anyhow::bail!("Android 子网路由监听器抛出异常");
                     }
                     call_result?;
                     Ok(())
@@ -1030,7 +1055,11 @@ fn parse_config_from_json(json_str: &str) -> anyhow::Result<Config> {
         #[serde(default)]
         input: Vec<NetInput>,
         #[serde(default)]
+        subnet_mapping: Vec<SubnetMapping>,
+        #[serde(default)]
         output: Vec<ipnet::Ipv4Net>,
+        #[serde(default)]
+        auto_sync_subnet: bool,
         #[serde(default)]
         no_nat: bool,
         #[serde(default)]
@@ -1142,7 +1171,9 @@ fn parse_config_from_json(json_str: &str) -> anyhow::Result<Config> {
         password: cfg.password,
         cert_mode,
         input: cfg.input,
+        subnet_mapping: cfg.subnet_mapping,
         output: cfg.output,
+        auto_sync_subnet: cfg.auto_sync_subnet,
         no_nat: cfg.no_nat,
         device_mode: cfg.device_mode,
         mtu: cfg.mtu,
@@ -1260,6 +1291,104 @@ pub extern "system" fn Java_com_vnt_VntNetwork_nativeCompleteIpUpdate<'local>(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vnt_VntNetwork_nativePrepareRouteUpdate(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    #[cfg(target_os = "android")]
+    {
+        jni_guard!(env, 0, {
+            let result: anyhow::Result<()> = (|| {
+                let (manager, runtime) = {
+                    let state = GLOBAL_STATE.lock();
+                    let state = state.as_ref().context("VNT not initialized")?;
+                    (
+                        state
+                            .network_managers
+                            .get(&handle)
+                            .context("Invalid handle")?
+                            .clone(),
+                        state.runtime.clone(),
+                    )
+                };
+                let manager = manager.lock();
+                let manager = manager
+                    .as_ref()
+                    .context("Network manager already destroyed")?;
+                runtime.block_on(manager.prepare_android_route_update())
+            })();
+            match result {
+                Ok(()) => 1,
+                Err(error) => {
+                    let _ = env.throw(format!("Failed to prepare route update: {error:#}"));
+                    0
+                }
+            }
+        })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = handle;
+        let _ = env.throw("Android route update is not supported on this platform");
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_vnt_VntNetwork_nativeCompleteRouteUpdate(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    tun_fd: jint,
+) -> jboolean {
+    #[cfg(target_os = "android")]
+    {
+        jni_guard!(env, 0, {
+            if tun_fd < 0 {
+                let _ = env.throw("Android route update requires a TUN fd");
+                return 0;
+            }
+            // Ownership transfers at the JNI boundary, including every failure path.
+            // SAFETY: Java passes a detached ParcelFileDescriptor exactly once.
+            let tun_fd = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+            let result: anyhow::Result<()> = (|| {
+                let (manager, runtime) = {
+                    let state = GLOBAL_STATE.lock();
+                    let state = state.as_ref().context("VNT not initialized")?;
+                    (
+                        state
+                            .network_managers
+                            .get(&handle)
+                            .context("Invalid handle")?
+                            .clone(),
+                        state.runtime.clone(),
+                    )
+                };
+                let manager = manager.lock();
+                let manager = manager
+                    .as_ref()
+                    .context("Network manager already destroyed")?;
+                runtime.block_on(manager.complete_android_route_update(tun_fd))
+            })();
+            match result {
+                Ok(()) => 1,
+                Err(error) => {
+                    let _ = env.throw(format!("Failed to complete route update: {error:#}"));
+                    0
+                }
+            }
+        })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (handle, tun_fd);
+        let _ = env.throw("Android route update is not supported on this platform");
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1290,6 +1419,18 @@ mod tests {
         assert_eq!(encryption_state(Some("local"), None), 3);
         assert_eq!(encryption_state(None, Some("peer")), 4);
         assert_eq!(encryption_state(Some("local"), Some("peer")), 5);
+    }
+
+    #[test]
+    fn serializes_subnet_routes_for_android() {
+        let routes = vec![
+            "192.168.0.0/24,10.26.0.2".parse().unwrap(),
+            "172.16.0.0/16,10.26.0.3".parse().unwrap(),
+        ];
+        assert_eq!(
+            subnet_routes_json(routes).unwrap(),
+            r#"["192.168.0.0/24,10.26.0.2","172.16.0.0/16,10.26.0.3"]"#
+        );
     }
 
     #[test]
@@ -1334,5 +1475,25 @@ mod tests {
         assert_eq!(config.turn.len(), 2);
         assert_eq!(config.turn[0].to_string(), "10.26.0.0/16,10.26.0.2");
         assert_eq!(config.turn[1].to_string(), "10.26.1.9,10.26.0.3");
+    }
+
+    #[test]
+    fn parses_exit_subnet_mapping_from_json() {
+        let mut config = parse_config_from_json(
+            r#"{
+                "server":["tcp://127.0.0.1:29872"],
+                "network_code":"test",
+                "output":["192.168.1.0/24"],
+                "subnet_mapping":["192.168.2.2/32,192.168.1.3/32"],
+                "auto_sync_subnet":true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.subnet_mapping[0].to_string(),
+            "192.168.2.2/32,192.168.1.3/32"
+        );
+        assert!(config.auto_sync_subnet);
+        config.normalize().unwrap();
     }
 }

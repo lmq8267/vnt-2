@@ -1,5 +1,5 @@
 use crate::crypto::PacketCrypto;
-use crate::nat::NetInput;
+use crate::nat::{NetInput, SubnetMapping};
 use crate::port_mapping::PortMapping;
 use crate::tls::verifier::CertValidationMode;
 use crate::tunnel_core::server::transport::config::{ConnectRegConfig, ProtocolAddress};
@@ -246,7 +246,9 @@ pub struct Config {
     pub rtx: bool,
     pub fec: bool,
     pub input: Vec<NetInput>,
+    pub subnet_mapping: Vec<SubnetMapping>,
     pub output: Vec<Ipv4Net>,
+    pub auto_sync_subnet: bool,
     pub no_nat: bool,
     pub device_mode: DeviceMode,
     pub mtu: Option<u16>,
@@ -263,6 +265,7 @@ impl Config {
         self.check_turn_rules()?;
         let mut seen = HashSet::new();
         self.turn.retain(|rule| seen.insert(rule.clone()));
+        crate::nat::subnet_mapping::normalize_and_validate(&mut self.subnet_mapping, &self.output)?;
         Ok(())
     }
 
@@ -350,6 +353,10 @@ impl Config {
             ip: registration_ip,
             key_sign: self.key_sign(),
             ip_variable: self.ip.is_none(),
+            advertised_subnets: std::sync::Arc::new(crate::nat::advertised_subnets(
+                &self.output,
+                &self.subnet_mapping,
+            )),
             default_interface,
         }
     }

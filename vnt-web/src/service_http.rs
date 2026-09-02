@@ -30,7 +30,7 @@ use tower_http::cors::{Any, CorsLayer};
 use vnt_core::api::VntApi;
 use vnt_core::context::config::{Config as CoreConfig, DeviceMode, PeerAddress, TurnRule};
 use vnt_core::core::{DEFAULT_MTU, NetworkManager, RegisterResponse};
-use vnt_core::nat::NetInput;
+use vnt_core::nat::{NetInput, SubnetMapping};
 use vnt_core::port_mapping::PortMapping;
 use vnt_core::tls::verifier::CertValidationMode;
 use vnt_core::tunnel_core::server::transport::config::ProtocolAddress;
@@ -278,7 +278,11 @@ pub struct StartConfig {
     #[serde(default)]
     pub input: Vec<NetInput>,
     #[serde(default)]
+    pub subnet_mapping: Vec<SubnetMapping>,
+    #[serde(default)]
     pub output: Vec<Ipv4Net>,
+    #[serde(default)]
+    pub auto_sync_subnet: bool,
     #[serde(default)]
     pub no_nat: bool,
     #[serde(default)]
@@ -349,6 +353,9 @@ struct HttpAppInfo {
     compress: Option<bool>,
     encrypt: Option<bool>,
     rtx: Option<bool>,
+    input: Vec<NetInput>,
+    output: Vec<Ipv4Net>,
+    automatic_input: Vec<NetInput>,
     /// 启动后配置文件是否发生过变化(与启动时的配置快照对比)
     config_changed: bool,
 }
@@ -951,7 +958,6 @@ async fn start_vnt_network(
     task_group: vnt_core::utils::task_control::TaskGroup,
     task_group_guard: vnt_core::utils::task_control::TaskGroupGuard,
 ) -> anyhow::Result<()> {
-    let sub_input = core_config.input.clone();
     let mut network_manager =
         NetworkManager::create_network(Box::new(core_config), task_group.clone())
             .await
@@ -1023,26 +1029,6 @@ async fn start_vnt_network(
             .await
             .with_context(|| format!("设置 {} 虚拟网卡 IP 失败", mode))?;
         state.record_log(&file_name, "设置 IP 成功");
-
-        // 配置子网路由
-        if !sub_input.is_empty()
-            && let Ok(if_index) = network_manager.device_if_index().await
-            && let Ok(mut route_manager) = route_manager::RouteManager::new()
-        {
-            state.record_log(&file_name, "配置子网路由");
-            for input in &sub_input {
-                let route =
-                    route_manager::Route::new(input.net.network().into(), input.net.prefix_len())
-                        .with_gateway(input.target_ip.into())
-                        .with_if_index(if_index);
-
-                if let Err(e) = route_manager.add(&route) {
-                    log::error!("add route [{route}] error: {e:?}");
-                } else {
-                    log::info!("add route [{route}] successful");
-                }
-            }
-        }
     } else {
         state.record_log(&file_name, "device_mode=no，不创建虚拟网卡");
     }
@@ -1253,6 +1239,12 @@ async fn get_info(
             compress: config.as_ref().map(|v| v.compress),
             encrypt: config.as_ref().map(|v| v.password.is_some()),
             rtx: config.as_ref().map(|v| v.rtx),
+            input: config.as_ref().map(|v| v.input.clone()).unwrap_or_default(),
+            output: config
+                .as_ref()
+                .map(|v| v.output.clone())
+                .unwrap_or_default(),
+            automatic_input: api.automatic_subnet_routes(),
             config_changed,
         }
     } else {
@@ -1485,7 +1477,9 @@ fn convert_config(cfg: StartConfig) -> anyhow::Result<CoreConfig> {
         password: cfg.password,
         cert_mode,
         input: cfg.input,
+        subnet_mapping: cfg.subnet_mapping,
         output: cfg.output,
+        auto_sync_subnet: cfg.auto_sync_subnet,
         no_nat: cfg.no_nat,
         device_mode: cfg.device_mode,
         mtu: cfg.mtu,
@@ -1817,7 +1811,9 @@ mod tests {
             rtx: false,
             fec: false,
             input: Vec::new(),
+            subnet_mapping: Vec::new(),
             output: Vec::new(),
+            auto_sync_subnet: false,
             no_nat: false,
             // 默认无网卡，避免无关用例意外触发 tun_name 冲突
             device_mode: DeviceMode::No,
@@ -1876,6 +1872,21 @@ network_code = "test"
         assert_eq!(core.turn.len(), 2);
         assert_eq!(core.turn[0].to_string(), "10.26.0.0/16,10.26.0.2");
         assert_eq!(core.turn[1].to_string(), "10.26.1.9,10.26.0.3");
+    }
+
+    #[test]
+    fn test_convert_config_keeps_exit_subnet_mapping() {
+        let mut config = new_test_config();
+        config.subnet_mapping = vec!["192.168.2.2/32,192.168.1.3/32".parse().unwrap()];
+        config.output = vec!["192.168.1.0/24".parse().unwrap()];
+        config.auto_sync_subnet = true;
+        let mut core = convert_config(config).unwrap();
+        assert_eq!(
+            core.subnet_mapping[0].to_string(),
+            "192.168.2.2/32,192.168.1.3/32"
+        );
+        assert!(core.auto_sync_subnet);
+        core.normalize().unwrap();
     }
 
     #[test]

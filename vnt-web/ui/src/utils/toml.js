@@ -14,7 +14,9 @@ export const emptyFormData = () => ({
   no_punch: false,
   no_broadcast: false,
   input: [],
+  subnet_mapping: [],
   output: [],
+  auto_sync_subnet: false,
   no_nat: false,
   device_mode: "tun",
   port_mapping: [],
@@ -93,6 +95,14 @@ export const parseTomlToForm = (toml) => {
         const items = match[1].match(/"([^"]*)"/g);
         if (items) data.output = items.map((s) => s.replace(/"/g, ""));
       }
+    } else if (trimmed.startsWith("subnet_mapping")) {
+      const match = trimmed.match(/subnet_mapping\s*=\s*\[(.*)\]/);
+      if (match) {
+        const items = match[1].match(/"([^"]*)"/g);
+        if (items) data.subnet_mapping = items.map((s) => s.replace(/"/g, ""));
+      }
+    } else if (trimmed.match(/^auto_sync_subnet\s*=/)) {
+      data.auto_sync_subnet = trimmed.includes("true");
     } else if (trimmed.match(/^no_nat\s*=/)) {
       data.no_nat = trimmed.includes("true");
     } else if (trimmed.match(/^no_tun\s*=/)) {
@@ -172,7 +182,7 @@ export const formToToml = (formData) => {
 
   const servers = formData.server.filter((s) => s.trim());
   if (servers.length > 0) {
-    toml += "# 服务器地址列表(支持 quic / tcp / wss / dynamic) (必填)\n";
+    toml += "# 服务器地址列表(省略协议时默认 tcp；支持 quic / tcp / wss / dynamic) (必填)\n";
     toml += "# dynamic 协议使用dns txt解析记录值\n";
     toml += `server = [${servers.map((s) => `"${s}"`).join(", ")}]\n`;
   }
@@ -234,6 +244,17 @@ export const formToToml = (formData) => {
   if (outputs.length > 0) {
     toml += "\n# 出栈允许网段，用于点对网，允许指定网段的转发\n";
     toml += `output = [${outputs.map((s) => `"${s}"`).join(", ")}]\n`;
+  }
+
+  const subnetMappings = formData.subnet_mapping.filter((s) => s.trim());
+  if (subnetMappings.length > 0) {
+    toml += "# 出口端子网映射（映射CIDR,真实CIDR），按最长前缀匹配\n";
+    toml += `subnet_mapping = [${subnetMappings.map((s) => `"${s}"`).join(", ")}]\n`;
+  }
+
+  if (formData.auto_sync_subnet) {
+    toml += "\n# 自动获取并应用其他在线节点的出口子网\n";
+    toml += "auto_sync_subnet = true\n";
   }
 
   if (formData.no_nat) {
@@ -326,7 +347,7 @@ export const NEW_CONFIG_TEMPLATE = `# config_name = "配置名称"
 # 网络编号，相同网络编号的会组在同一个虚拟网 (必填)
 network_code = "your_network_code"
 
-# 服务器地址列表(支持 quic / tcp / wss / dynamic) (必填)
+# 服务器地址列表(省略协议时默认 tcp；支持 quic / tcp / wss / dynamic) (必填)
 # dynamic 协议使用dns txt解析记录值
 server = ["quic://1.2.3.4:29872"]
 
@@ -362,8 +383,14 @@ server = ["quic://1.2.3.4:29872"]
 # 入栈监听网段 (逗号分隔的 CIDR 和目标 IP)，用于点对网，将指定网段的流量发送到目标节点
 # input = ["192.168.0.0/24,10.26.0.2", "192.168.1.0/24,10.26.0.3"]
 
+# 出口端子网映射，两侧掩码必须相同；本机 output 需允许真实网段
+# subnet_mapping = ["192.168.2.0/24,192.168.1.0/24", "192.168.2.2/32,192.168.1.3/32"]
+
 # 出栈允许网段，用于点对网，允许指定网段的转发
 # output = ["0.0.0.0/0"]
+
+# 是否自动获取并应用其他在线节点的出口子网
+# auto_sync_subnet = false
 
 # 是否关闭内置子网NAT，关闭(设为true)后需要配置网卡转发，否则无法使用点对网。通常关闭内置子网NAT，使用系统的网卡转发，点对网性能会更好
 # no_nat = false

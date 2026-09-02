@@ -15,6 +15,10 @@ public class VntConfig {
     private final List<String> servers;
     private final List<String> peerAddresses;
     private final List<String> turnRules;
+    private final List<String> inputRoutes;
+    private final List<String> subnetMappings;
+    private final List<String> outputRoutes;
+    private final boolean autoSyncSubnet;
     private final String networkCode;
     private final String password;
     private final String deviceId;
@@ -40,6 +44,10 @@ public class VntConfig {
         this.servers = builder.servers;
         this.peerAddresses = builder.peerAddresses;
         this.turnRules = builder.turnRules;
+        this.inputRoutes = builder.inputRoutes;
+        this.subnetMappings = builder.subnetMappings;
+        this.outputRoutes = builder.outputRoutes;
+        this.autoSyncSubnet = builder.autoSyncSubnet;
         this.networkCode = builder.networkCode;
         this.password = builder.password;
         this.deviceId = builder.deviceId;
@@ -92,6 +100,10 @@ public class VntConfig {
             json.put("turn", turnArray);
         }
 
+        putStringArray(json, "input", inputRoutes);
+        putStringArray(json, "subnet_mapping", subnetMappings);
+        putStringArray(json, "output", outputRoutes);
+
         // 可选项
         if (password != null) json.put("password", password);
         if (deviceId != null) json.put("device_id", deviceId);
@@ -111,6 +123,7 @@ public class VntConfig {
         json.put("no_nat", noNat);
         json.put("device_mode", deviceMode);
         json.put("allow_mapping", allowMapping);
+        json.put("auto_sync_subnet", autoSyncSubnet);
 
         // 数组
         if (!portMapping.isEmpty()) {
@@ -140,6 +153,13 @@ public class VntConfig {
         return json.toString();
     }
 
+    private static void putStringArray(JSONObject json, String name, List<String> values) {
+        if (values.isEmpty()) return;
+        JSONArray array = new JSONArray();
+        for (String value : values) array.put(value);
+        json.put(name, array);
+    }
+
     /**
      * 配置构建器
      */
@@ -147,6 +167,10 @@ public class VntConfig {
         private List<String> servers = new ArrayList<>();
         private List<String> peerAddresses = new ArrayList<>();
         private List<String> turnRules = new ArrayList<>();
+        private List<String> inputRoutes = new ArrayList<>();
+        private List<String> subnetMappings = new ArrayList<>();
+        private List<String> outputRoutes = new ArrayList<>();
+        private boolean autoSyncSubnet = false;
         private String networkCode;
         private String password;
         private String deviceId;
@@ -192,6 +216,30 @@ public class VntConfig {
          */
         public Builder addTurnRule(String turnRule) {
             this.turnRules.add(turnRule);
+            return this;
+        }
+
+        /** 添加点对网入口路由，格式：映射CIDR,出口节点虚拟IP。 */
+        public Builder addInputRoute(String route) {
+            this.inputRoutes.add(route);
+            return this;
+        }
+
+        /** 自动获取并应用其他在线节点的出口子网。 */
+        public Builder setAutoSyncSubnet(boolean autoSyncSubnet) {
+            this.autoSyncSubnet = autoSyncSubnet;
+            return this;
+        }
+
+        /** 添加出口端子网映射，格式：映射CIDR,真实CIDR；真实网段需由 output 允许。 */
+        public Builder addSubnetMapping(String mapping) {
+            this.subnetMappings.add(mapping);
+            return this;
+        }
+
+        /** 添加出口端允许转发的真实 CIDR。 */
+        public Builder addOutputRoute(String cidr) {
+            this.outputRoutes.add(cidr);
             return this;
         }
 
